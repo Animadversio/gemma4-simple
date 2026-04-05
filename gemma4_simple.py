@@ -78,6 +78,8 @@ class TextConfig:
     rope_global_base_freq: float = 1_000_000.0
     attn_logit_softcapping: float | None = None
     final_logit_softcapping: float | None = 30.0
+    # v_norm is only used when attention_k_eq_v=True (larger Gemma 4 variants)
+    use_v_norm: bool = False
     # Per-layer input gate (Gemma4-specific)
     hidden_size_per_layer_input: int = 0
     # Misc
@@ -261,7 +263,8 @@ class TextAttention(nn.Module):
         # Per-head norms (applied before RoPE)
         self.q_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
-        self.v_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+        # v_norm only exists when attention_k_eq_v=True (larger Gemma 4 models)
+        self.v_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps) if cfg.use_v_norm else None
 
         self.attn_logit_softcapping = cfg.attn_logit_softcapping
         self.scaling = self.head_dim ** -0.5
@@ -291,7 +294,8 @@ class TextAttention(nn.Module):
             k = self.k_proj(hidden_states).view(B, L, Hkv, Dh)
             v = self.v_proj(hidden_states).view(B, L, Hkv, Dh)
             k = self.k_norm(k)
-            v = self.v_norm(v)
+            if self.v_norm is not None:
+                v = self.v_norm(v)
             k = apply_rotary_pos_emb(k, cos, sin, unsqueeze_dim=2)
             k = k.transpose(1, 2)  # [B, Hkv, L, Dh]
             v = v.transpose(1, 2)
