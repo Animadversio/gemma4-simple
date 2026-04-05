@@ -366,32 +366,35 @@ vc = hf_cfg.vision_config
 
 # Build our VisionConfig mirroring HF
 our_vis_cfg = VisionConfig(
-    hidden_size         = vc.hidden_size,
-    num_hidden_layers   = vc.num_hidden_layers,
-    num_attention_heads = vc.num_attention_heads,
-    head_dim            = vc.head_dim,
-    intermediate_size   = vc.intermediate_size,
-    rms_norm_eps        = vc.rms_norm_eps,
-    rope_theta          = vc.rope_parameters["rope_theta"],
+    hidden_size              = vc.hidden_size,
+    num_hidden_layers        = vc.num_hidden_layers,
+    num_attention_heads      = vc.num_attention_heads,
+    head_dim                 = vc.head_dim,
+    intermediate_size        = vc.intermediate_size,
+    patch_size               = vc.patch_size,
+    position_embedding_size  = vc.position_embedding_size,
+    pooling_kernel_size      = vc.pooling_kernel_size,
+    rms_norm_eps             = vc.rms_norm_eps,
+    rope_theta               = vc.rope_parameters["rope_theta"],
+    standardize              = vc.standardize,
+    use_clipped_linears      = vc.use_clipped_linears,
 )
 
-# Load vision weights (ClippableLinear stores weights under .linear.weight)
-vis_wts = load_tensors([
-    f"{vis_prefix}.input_layernorm.weight",
-    f"{vis_prefix}.post_attention_layernorm.weight",
-    f"{vis_prefix}.pre_feedforward_layernorm.weight",
-    f"{vis_prefix}.post_feedforward_layernorm.weight",
-    f"{vis_prefix}.self_attn.q_proj.linear.weight",
-    f"{vis_prefix}.self_attn.k_proj.linear.weight",
-    f"{vis_prefix}.self_attn.v_proj.linear.weight",
-    f"{vis_prefix}.self_attn.o_proj.linear.weight",
-    f"{vis_prefix}.self_attn.q_norm.weight",
-    f"{vis_prefix}.self_attn.k_norm.weight",
-    # mlp: gate_proj / up_proj / down_proj (SwiGLU)
-    f"{vis_prefix}.mlp.gate_proj.linear.weight",
-    f"{vis_prefix}.mlp.up_proj.linear.weight",
-    f"{vis_prefix}.mlp.down_proj.linear.weight",
-])
+# Load vision weights (ClippableLinear: .linear.weight + input/output clip scalars)
+_clip_bufs = ["input_min", "input_max", "output_min", "output_max"]
+_vis_projs = [f"self_attn.{p}" for p in ["q_proj","k_proj","v_proj","o_proj"]] + \
+             [f"mlp.{p}" for p in ["gate_proj","up_proj","down_proj"]]
+vis_wts = load_tensors(
+    [f"{vis_prefix}.input_layernorm.weight",
+     f"{vis_prefix}.post_attention_layernorm.weight",
+     f"{vis_prefix}.pre_feedforward_layernorm.weight",
+     f"{vis_prefix}.post_feedforward_layernorm.weight",
+     f"{vis_prefix}.self_attn.q_norm.weight",
+     f"{vis_prefix}.self_attn.k_norm.weight",
+    ] +
+    [f"{vis_prefix}.{p}.linear.weight" for p in _vis_projs] +
+    [f"{vis_prefix}.{p}.{b}" for p in _vis_projs for b in _clip_bufs]
+)
 
 # Small random vision input: B=1, N=16 patches (4x4 grid), D=hidden_size
 Bv, Nv, Dv = 1, 16, vc.hidden_size
@@ -406,18 +409,9 @@ vis_pos_ids = torch.stack([rows, cols], dim=-1).unsqueeze(0)  # [1, 16, 2]
 vc._attn_implementation = "eager"
 hf_vis_layer = HFVisionEncoderLayer(vc, layer_idx=LAYER).to(DTYPE)
 hf_vis_layer.input_layernorm.weight.data.copy_(vis_wts[f"{vis_prefix}.input_layernorm.weight"])
-hf_vis_layer.post_attention_layernorm.weight.data.copy_(vis_wts[f"{vis_prefix}.post_attention_layernorm.weight"])
-hf_vis_layer.pre_feedforward_layernorm.weight.data.copy_(vis_wts[f"{vis_prefix}.pre_feedforward_layernorm.weight"])
-hf_vis_layer.post_feedforward_layernorm.weight.data.copy_(vis_wts[f"{vis_prefix}.post_feedforward_layernorm.weight"])
-hf_vis_layer.self_attn.q_proj.linear.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.q_proj.linear.weight"])
-hf_vis_layer.self_attn.k_proj.linear.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.k_proj.linear.weight"])
-hf_vis_layer.self_attn.v_proj.linear.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.v_proj.linear.weight"])
-hf_vis_layer.self_attn.o_proj.linear.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.o_proj.linear.weight"])
-hf_vis_layer.self_attn.q_norm.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.q_norm.weight"])
-hf_vis_layer.self_attn.k_norm.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.k_norm.weight"])
-hf_vis_layer.mlp.gate_proj.linear.weight.data.copy_(vis_wts[f"{vis_prefix}.mlp.gate_proj.linear.weight"])
-hf_vis_layer.mlp.up_proj.linear.weight.data.copy_(vis_wts[f"{vis_prefix}.mlp.up_proj.linear.weight"])
-hf_vis_layer.mlp.down_proj.linear.weight.data.copy_(vis_wts[f"{vis_prefix}.mlp.down_proj.linear.weight"])
+# Load all HF layer weights via state_dict (includes clip scalars automatically)
+hf_vis_sd = {k.replace(f"{vis_prefix}.", ""): v for k, v in vis_wts.items()}
+hf_vis_layer.load_state_dict(hf_vis_sd, strict=False)
 
 # Compute HF vision RoPE position embeddings
 hf_vis_rope = HFVisionRoPE(vc).to(DTYPE)
@@ -441,17 +435,18 @@ our_vis_layer.input_layernorm.weight.data.copy_(vis_wts[f"{vis_prefix}.input_lay
 our_vis_layer.post_attention_layernorm.weight.data.copy_(vis_wts[f"{vis_prefix}.post_attention_layernorm.weight"])
 our_vis_layer.pre_feedforward_layernorm.weight.data.copy_(vis_wts[f"{vis_prefix}.pre_feedforward_layernorm.weight"])
 our_vis_layer.post_feedforward_layernorm.weight.data.copy_(vis_wts[f"{vis_prefix}.post_feedforward_layernorm.weight"])
-our_vis_layer.self_attn.q_proj.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.q_proj.linear.weight"])
-our_vis_layer.self_attn.k_proj.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.k_proj.linear.weight"])
-our_vis_layer.self_attn.v_proj.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.v_proj.linear.weight"])
-our_vis_layer.self_attn.o_proj.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.o_proj.linear.weight"])
 our_vis_layer.self_attn.q_norm.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.q_norm.weight"])
 our_vis_layer.self_attn.k_norm.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.k_norm.weight"])
-# fc1 maps to gate_proj (our plain GELU vs HF's SwiGLU gating),
-# fc2 maps to down_proj for weight shapes
-our_vis_layer.mlp.gate_proj.weight.data.copy_(vis_wts[f"{vis_prefix}.mlp.gate_proj.linear.weight"])
-our_vis_layer.mlp.up_proj.weight.data.copy_(vis_wts[f"{vis_prefix}.mlp.up_proj.linear.weight"])
-our_vis_layer.mlp.down_proj.weight.data.copy_(vis_wts[f"{vis_prefix}.mlp.down_proj.linear.weight"])
+# ClippableLinear: load .linear.weight and clip scalar buffers
+def _load_clippable(module, prefix):
+    module.linear.weight.data.copy_(vis_wts[f"{prefix}.linear.weight"])
+    for buf in ["input_min", "input_max", "output_min", "output_max"]:
+        getattr(module, buf).fill_(vis_wts[f"{prefix}.{buf}"].item())
+
+for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+    _load_clippable(getattr(our_vis_layer.self_attn, proj), f"{vis_prefix}.self_attn.{proj}")
+for proj in ["gate_proj", "up_proj", "down_proj"]:
+    _load_clippable(getattr(our_vis_layer.mlp, proj), f"{vis_prefix}.mlp.{proj}")
 
 # Run our layer forward (uses our 2-D RoPE internally)
 with torch.no_grad():
@@ -471,7 +466,7 @@ with torch.no_grad():
     residual_v = xv
     h_v = our_vis_layer.input_layernorm(xv)
 
-    q_v = our_vis_layer.self_attn.q_proj(h_v).view(Bv, Nv, H_vis, Dh_vis)
+    q_v = our_vis_layer.self_attn.q_proj(h_v).view(Bv, Nv, H_vis, Dh_vis)  # ClippableLinear
     k_v = our_vis_layer.self_attn.k_proj(h_v).view(Bv, Nv, H_vis, Dh_vis)
     v_v = our_vis_layer.self_attn.v_proj(h_v).view(Bv, Nv, H_vis, Dh_vis)
 
@@ -535,6 +530,64 @@ with torch.no_grad():
     our_pool_flat, _ = our_pooler(xp, pool_pos_ids, pool_padding)
 
 results.append(check("VisionPooler HF vs ours", hf_pool_flat, our_pool_flat, atol=1e-3))
+
+# ══════════════════════════════════════════════════════════════════
+# Test 8: Full VisionModel (PatchEmbedder → Encoder → Pooler)
+# ══════════════════════════════════════════════════════════════════
+print("\n── Full VisionModel ──────────────────────────────────────────")
+
+from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionModel as HFVisionModel
+from gemma4_simple import VisionModel
+
+# Load all vision tower weights
+with safe_open(f"{HF_CKPT}/model.safetensors", framework="pt", device="cpu") as f:
+    all_vis_keys = [k for k in f.keys() if "vision_tower" in k]
+    all_vis_wts = {k: f.get_tensor(k).to(DTYPE) for k in all_vis_keys}
+
+# Build HF VisionModel and load weights
+vc._attn_implementation = "eager"
+hf_vis_model = HFVisionModel(vc).to(DTYPE)
+hf_state = {}
+for k, v in all_vis_wts.items():
+    # Strip "model.vision_tower." prefix
+    new_k = k.replace("model.vision_tower.", "")
+    hf_state[new_k] = v
+missing, unexpected = hf_vis_model.load_state_dict(hf_state, strict=False)
+if missing:
+    print(f"  HF missing keys: {missing[:5]}")
+if unexpected:
+    print(f"  HF unexpected keys: {unexpected[:5]}")
+
+# Build our VisionModel and load weights
+our_vis_model = VisionModel(our_vis_cfg).to(DTYPE)
+our_vis_state = {}
+for k, v in all_vis_wts.items():
+    # Strip model.vision_tower. prefix — keys now match our model structure directly
+    new_k = k.replace("model.vision_tower.", "")
+    our_vis_state[new_k] = v
+missing2, unexpected2 = our_vis_model.load_state_dict(our_vis_state, strict=False)
+if missing2:
+    print(f"  Ours missing keys: {missing2[:10]}")
+if unexpected2:
+    print(f"  Ours unexpected keys: {unexpected2[:10]}")
+
+# Small input: 1 image, 9 patches in a 3×3 grid (k=3 pooling → 1 output token)
+Bfull = 1
+rows3 = torch.arange(3).repeat_interleave(3)
+cols3 = torch.arange(3).repeat(3)
+full_pos_ids = torch.stack([rows3, cols3], dim=-1).unsqueeze(0)  # [1, 9, 2]
+patch_dim_full = vc.patch_size * vc.patch_size * 3
+full_pixel = torch.rand(Bfull, 9, patch_dim_full, dtype=DTYPE)
+
+with torch.no_grad():
+    hf_full_out = hf_vis_model(
+        pixel_values=full_pixel,
+        pixel_position_ids=full_pos_ids,
+    ).last_hidden_state  # [M, D]
+
+    our_full_out = our_vis_model(full_pixel, full_pos_ids)  # [M, D]
+
+results.append(check("Full VisionModel HF vs ours", hf_full_out, our_full_out, atol=1e-2))
 
 # ══════════════════════════════════════════════════════════════════
 # Summary

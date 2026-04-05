@@ -90,17 +90,18 @@ class TextConfig:
 
 @dataclass
 class VisionConfig:
-    hidden_size: int = 1152
-    num_hidden_layers: int = 27
-    num_attention_heads: int = 16
-    head_dim: int = 72
-    intermediate_size: int = 4096
-    patch_size: int = 14
-    image_size: int = 448
-    pooling_kernel_size: int = 4     # spatial pooling factor
-    rope_theta: float = 10_000.0
+    hidden_size: int = 768
+    num_hidden_layers: int = 16
+    num_attention_heads: int = 12
+    head_dim: int = 64
+    intermediate_size: int = 3072
+    patch_size: int = 16
+    position_embedding_size: int = 10240  # lookup table size per axis
+    pooling_kernel_size: int = 3     # spatial pooling factor
+    rope_theta: float = 100.0
     rms_norm_eps: float = 1e-6
     standardize: bool = False        # optional post-pooling standardization
+    use_clipped_linears: bool = True  # clamp activations in ClippableLinear
 
 
 @dataclass
@@ -560,23 +561,38 @@ class VisionRotaryEmbedding(nn.Module):
 
 class VisionPatchEmbedder(nn.Module):
     """
-    Project pixel patches to hidden_size and add 2-D sinusoidal positional
-    embeddings (one per spatial dimension, summed).
+    Project pixel patches to hidden_size and add learned 2-D positional embeddings.
 
-    HF source uses `self._position_embeddings(pixel_position_ids, padding_positions)`
-    which internally builds per-axis sinusoidal embeddings and projects them to
-    hidden_size before adding to the patch features.  We reproduce the same idea
-    with a simple learned linear projection from a sin/cos basis.
+    Matches HF Gemma4VisionPatchEmbedder exactly:
+      - input_proj: Linear(patch_dim, hidden_size, bias=False)
+      - position_embedding_table: Parameter(2, position_embedding_size, hidden_size)
+        where axis 0 = x, axis 1 = y; lookup via one-hot → matmul, then sum axes.
     """
     def __init__(self, cfg: VisionConfig):
         super().__init__()
         patch_dim = cfg.patch_size * cfg.patch_size * 3
         self.input_proj = nn.Linear(patch_dim, cfg.hidden_size, bias=False)
-        # Learned positional embedding: one embedding table per axis (x, y),
-        # each of size (max_positions, hidden_size).
-        max_pos = cfg.image_size // cfg.patch_size + 1  # +1 for safety
-        self.pos_emb_x = nn.Embedding(max_pos + 1, cfg.hidden_size)  # +1 for padding (-1→0)
-        self.pos_emb_y = nn.Embedding(max_pos + 1, cfg.hidden_size)
+        # Single parameter table covering both spatial axes, matching HF layout
+        self.position_embedding_table = nn.Parameter(
+            torch.ones(2, cfg.position_embedding_size, cfg.hidden_size)
+        )
+        self.position_embedding_size = cfg.position_embedding_size
+
+    def _position_embeddings(
+        self,
+        pixel_position_ids: torch.Tensor,  # [B, N, 2]
+        padding_mask: torch.Tensor,        # [B, N] True = padding
+    ) -> torch.Tensor:
+        pos = pixel_position_ids.clamp(min=0)  # [B, N, 2]
+        # one_hot: [B, N, 2, position_embedding_size]
+        one_hot = F.one_hot(pos, num_classes=self.position_embedding_size)
+        # permute to [B, 2, N, pos_emb_size] for matmul with table [2, pos_emb_size, D]
+        one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)
+        # [B, 2, N, D] → sum over axes → [B, N, D]
+        pos_embed = (one_hot @ self.position_embedding_table).sum(dim=1)
+        # Zero out padding
+        pos_embed = torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(pos_embed), pos_embed)
+        return pos_embed
 
     def forward(
         self,
@@ -584,25 +600,46 @@ class VisionPatchEmbedder(nn.Module):
         pixel_position_ids: torch.Tensor,   # [B, N, 2]  (x, y; -1 = padding)
         padding_mask: torch.Tensor,         # [B, N] True = padding
     ) -> torch.Tensor:
-        # Normalise pixels: [0,1] → [-1,1]
-        pixel_values = 2.0 * (pixel_values - 0.5)
+        pixel_values = 2.0 * (pixel_values - 0.5)  # [0,1] → [-1,1]
         h = self.input_proj(pixel_values.to(self.input_proj.weight.dtype))
-
-        # Shift -1 padding positions to index 0 (won't matter; masked out later)
-        pos = pixel_position_ids.clamp(min=0)   # [B, N, 2]
-        pos_embed = self.pos_emb_x(pos[..., 0]) + self.pos_emb_y(pos[..., 1])  # [B, N, D]
-        h = h + pos_embed
+        h = h + self._position_embeddings(pixel_position_ids, padding_mask)
         h = h.masked_fill(padding_mask.unsqueeze(-1), 0.0)
         return h
+
+
+class ClippableLinear(nn.Module):
+    """
+    nn.Linear wrapped with optional input/output clamping (matches HF Gemma4ClippableLinear).
+    Clip bounds are stored as buffers and loaded from checkpoint.
+    When use_clipped_linears=False (default), bounds stay at ±inf (no-op clamp).
+    """
+    def __init__(self, in_features: int, out_features: int, use_clipped_linears: bool = False):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=False)
+        if use_clipped_linears:
+            self.register_buffer("input_min",  torch.tensor(-float("inf")))
+            self.register_buffer("input_max",  torch.tensor( float("inf")))
+            self.register_buffer("output_min", torch.tensor(-float("inf")))
+            self.register_buffer("output_max", torch.tensor( float("inf")))
+        self.use_clipped_linears = use_clipped_linears
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_clipped_linears:
+            x = torch.clamp(x, self.input_min, self.input_max)
+        x = self.linear(x)
+        if self.use_clipped_linears:
+            x = torch.clamp(x, self.output_min, self.output_max)
+        return x
 
 
 class VisionMLP(nn.Module):
     """SwiGLU FFN used in the vision encoder (matches HF Gemma4VisionMLP)."""
     def __init__(self, cfg: VisionConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.up_proj   = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
+        clip = cfg.use_clipped_linears
+        self.gate_proj = ClippableLinear(cfg.hidden_size, cfg.intermediate_size, clip)
+        self.up_proj   = ClippableLinear(cfg.hidden_size, cfg.intermediate_size, clip)
+        self.down_proj = ClippableLinear(cfg.intermediate_size, cfg.hidden_size, clip)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
@@ -623,10 +660,11 @@ class VisionAttention(nn.Module):
         # HF Gemma4VisionAttention uses scaling=1.0, not 1/sqrt(head_dim)
         self.scaling   = 1.0
 
-        self.q_proj = nn.Linear(D, H * Dh, bias=False)
-        self.k_proj = nn.Linear(D, H * Dh, bias=False)
-        self.v_proj = nn.Linear(D, H * Dh, bias=False)
-        self.o_proj = nn.Linear(H * Dh, D, bias=False)
+        clip = cfg.use_clipped_linears
+        self.q_proj = ClippableLinear(D, H * Dh, clip)
+        self.k_proj = ClippableLinear(D, H * Dh, clip)
+        self.v_proj = ClippableLinear(D, H * Dh, clip)
+        self.o_proj = ClippableLinear(H * Dh, D, clip)
 
         self.q_norm = RMSNorm(Dh, eps=cfg.rms_norm_eps, with_scale=True)
         self.k_norm = RMSNorm(Dh, eps=cfg.rms_norm_eps, with_scale=True)
@@ -664,7 +702,7 @@ class VisionAttention(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.scaling
         if attention_mask is not None:
             attn = attn + attention_mask   # additive mask (0 = attend, -inf = mask)
-        attn = F.softmax(attn, dim=-1)
+        attn = F.softmax(attn.float(), dim=-1).to(q.dtype)
 
         out = (attn @ v).transpose(1, 2).reshape(B, N, H * Dh)
         return self.o_proj(out)
