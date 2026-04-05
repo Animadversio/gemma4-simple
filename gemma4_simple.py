@@ -597,15 +597,15 @@ class VisionPatchEmbedder(nn.Module):
 
 
 class VisionMLP(nn.Module):
-    """GELU FFN used in the vision encoder (no SwiGLU — plain gate)."""
+    """SwiGLU FFN used in the vision encoder (matches HF Gemma4VisionMLP)."""
     def __init__(self, cfg: VisionConfig):
         super().__init__()
-        self.fc1 = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=True)
-        self.fc2 = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=True)
-        self.act = nn.GELU(approximate="tanh")
+        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
+        self.up_proj   = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.act(self.fc1(x)))
+        return self.down_proj(F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
 
 
 class VisionAttention(nn.Module):

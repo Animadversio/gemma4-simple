@@ -387,7 +387,7 @@ vis_wts = load_tensors([
     f"{vis_prefix}.self_attn.o_proj.linear.weight",
     f"{vis_prefix}.self_attn.q_norm.weight",
     f"{vis_prefix}.self_attn.k_norm.weight",
-    # mlp: gate_proj / up_proj / down_proj (SwiGLU) in HF
+    # mlp: gate_proj / up_proj / down_proj (SwiGLU)
     f"{vis_prefix}.mlp.gate_proj.linear.weight",
     f"{vis_prefix}.mlp.up_proj.linear.weight",
     f"{vis_prefix}.mlp.down_proj.linear.weight",
@@ -449,8 +449,9 @@ our_vis_layer.self_attn.q_norm.weight.data.copy_(vis_wts[f"{vis_prefix}.self_att
 our_vis_layer.self_attn.k_norm.weight.data.copy_(vis_wts[f"{vis_prefix}.self_attn.k_norm.weight"])
 # fc1 maps to gate_proj (our plain GELU vs HF's SwiGLU gating),
 # fc2 maps to down_proj for weight shapes
-our_vis_layer.mlp.fc1.weight.data.copy_(vis_wts[f"{vis_prefix}.mlp.gate_proj.linear.weight"])
-our_vis_layer.mlp.fc2.weight.data.copy_(vis_wts[f"{vis_prefix}.mlp.down_proj.linear.weight"])
+our_vis_layer.mlp.gate_proj.weight.data.copy_(vis_wts[f"{vis_prefix}.mlp.gate_proj.linear.weight"])
+our_vis_layer.mlp.up_proj.weight.data.copy_(vis_wts[f"{vis_prefix}.mlp.up_proj.linear.weight"])
+our_vis_layer.mlp.down_proj.weight.data.copy_(vis_wts[f"{vis_prefix}.mlp.down_proj.linear.weight"])
 
 # Run our layer forward (uses our 2-D RoPE internally)
 with torch.no_grad():
@@ -488,7 +489,7 @@ with torch.no_grad():
     h_v = our_vis_layer.post_attention_layernorm(attn_out_v)
     h_v = residual_v + h_v
 
-    # MLP block (our fc1/fc2 plain GELU architecture)
+    # MLP block (SwiGLU, matches HF)
     residual_v = h_v
     h_v = our_vis_layer.pre_feedforward_layernorm(h_v)
     h_v = our_vis_layer.mlp(h_v)
@@ -497,8 +498,8 @@ with torch.no_grad():
 
 results.append(check("VisionEncoderLayer (vs manual GT)", manual_vis_out, our_vis_out, atol=1e-3))
 
-# Also report HF vs ours (architectural diff expected in MLP)
-_ = check("VisionEncoderLayer HF vs ours (informational)", hf_vis_out, our_vis_out, atol=1e-2)
+# HF vs ours — should now match since MLP architecture is fixed
+results.append(check("VisionEncoderLayer HF vs ours", hf_vis_out, our_vis_out, atol=1e-2))
 
 # ══════════════════════════════════════════════════════════════════
 # Summary
