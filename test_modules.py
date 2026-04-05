@@ -36,7 +36,7 @@ from transformers.models.gemma4.modeling_gemma4 import (
 
 from gemma4_simple import (
     RMSNorm, TextAttention, TextMLP, TextDecoderLayer,
-    VisionAttention, VisionMLP, VisionEncoderLayer,
+    VisionAttention, VisionMLP, VisionEncoderLayer, VisionPooler,
     TextConfig, Gemma4Config, VisionConfig,
     apply_rotary_pos_emb, apply_2d_rope,
 )
@@ -500,6 +500,41 @@ results.append(check("VisionEncoderLayer (vs manual GT)", manual_vis_out, our_vi
 
 # HF vs ours — should now match since MLP architecture is fixed
 results.append(check("VisionEncoderLayer HF vs ours", hf_vis_out, our_vis_out, atol=1e-2))
+
+# ══════════════════════════════════════════════════════════════════
+# Test 7: VisionPooler (position-aware spatial pooling)
+# ══════════════════════════════════════════════════════════════════
+print("\n── VisionPooler ──────────────────────────────────────────────")
+
+from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionPooler as HFVisionPooler
+
+# 4×4 patch grid (16 patches), pool by k=2 → 2×2 = 4 output tokens
+Bp, Np, Dv = 1, 16, vc.hidden_size
+rows_p = torch.arange(4).repeat_interleave(4)   # [0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3]
+cols_p = torch.arange(4).repeat(4)              # [0,1,2,3, 0,1,2,3, ...]
+pool_pos_ids = torch.stack([rows_p, cols_p], dim=-1).unsqueeze(0)  # [1, 16, 2]
+pool_padding = torch.zeros(Bp, Np, dtype=torch.bool)               # no padding
+xp = torch.randn(Bp, Np, Dv, dtype=DTYPE)
+
+# HF pooler
+hf_pooler = HFVisionPooler(vc).to(DTYPE)
+output_length = Np // (vc.pooling_kernel_size ** 2)
+with torch.no_grad():
+    hf_pool_out, hf_pool_mask = hf_pooler(
+        hidden_states=xp,
+        pixel_position_ids=pool_pos_ids,
+        padding_positions=pool_padding,
+        output_length=output_length,
+    )
+    # HF returns [B, L, D] before masking; strip padding
+    hf_pool_flat = hf_pool_out[hf_pool_mask]
+
+# Our pooler
+our_pooler = VisionPooler(our_vis_cfg).to(DTYPE)
+with torch.no_grad():
+    our_pool_flat, _ = our_pooler(xp, pool_pos_ids, pool_padding)
+
+results.append(check("VisionPooler HF vs ours", hf_pool_flat, our_pool_flat, atol=1e-3))
 
 # ══════════════════════════════════════════════════════════════════
 # Summary

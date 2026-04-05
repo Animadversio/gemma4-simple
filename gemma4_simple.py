@@ -726,8 +726,9 @@ class VisionEncoder(nn.Module):
 
 class VisionPooler(nn.Module):
     """
-    Spatially average-pools patch features down by pooling_kernel_size²,
-    then scales by √hidden_size and strips padding tokens.
+    Spatially average-pools patch features using pixel_position_ids to group
+    patches into k×k kernels (matches HF Gemma4VisionPooler exactly).
+    Scales by √hidden_size and strips padding tokens.
     """
     def __init__(self, cfg: VisionConfig):
         super().__init__()
@@ -738,6 +739,33 @@ class VisionPooler(nn.Module):
             self.std_bias  = nn.Parameter(torch.zeros(cfg.hidden_size))
             self.std_scale = nn.Parameter(torch.ones(cfg.hidden_size))
 
+    def _avg_pool_by_positions(
+        self,
+        hidden_states: torch.Tensor,   # [B, N, D]
+        pixel_position_ids: torch.Tensor,  # [B, N, 2]
+        output_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Position-aware average pooling — groups patches by their (x//k, y//k) bin."""
+        N = hidden_states.shape[1]
+        k = int((N // output_length) ** 0.5)
+        k2 = k * k
+        if k2 * output_length != N:
+            raise ValueError(f"Cannot pool {N} patches to {output_length}: {k}^2 × {output_length} ≠ {N}")
+
+        # Clamp padding (-1) positions to 0 — padding is zeroed out already
+        pos = pixel_position_ids.clamp(min=0)              # [B, N, 2]
+        max_x = pos[..., 0].max(dim=-1, keepdim=True)[0] + 1  # [B, 1]
+        # Kernel index: which (col_bin, row_bin) does each patch fall into?
+        kx = torch.div(pos[..., 0], k, rounding_mode="floor")  # [B, N]
+        ky = torch.div(pos[..., 1], k, rounding_mode="floor")  # [B, N]
+        kernel_idxs = kx + (max_x // k) * ky               # [B, N] linear index
+
+        # One-hot weighted average: each kernel bin accumulates 1/k² of each patch
+        weights = F.one_hot(kernel_idxs.long(), output_length).float() / k2  # [B, N, L]
+        output = weights.transpose(1, 2) @ hidden_states.float()             # [B, L, D]
+        valid_mask = (weights != 0).any(dim=1)                               # [B, L]
+        return output.to(hidden_states.dtype), valid_mask
+
     def forward(
         self,
         hidden_states: torch.Tensor,          # [B, N, D]
@@ -745,20 +773,19 @@ class VisionPooler(nn.Module):
         padding_mask: torch.Tensor,           # [B, N] True = padding
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, N, D = hidden_states.shape
-        k2 = self.kernel ** 2
-        output_length = N // k2
+        output_length = N // (self.kernel ** 2)
 
         # Zero-out padding before pooling
         hidden_states = hidden_states.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
         if N != output_length:
-            # Simple reshape-based average pool (assumes square grid)
-            hidden_states = hidden_states.view(B, output_length, k2, D).mean(dim=2)
-            # Recompute padding mask for pooled sequence
-            padding_mask = padding_mask.view(B, output_length, k2).all(dim=-1)
+            hidden_states, valid_mask = self._avg_pool_by_positions(
+                hidden_states, pixel_position_ids, output_length
+            )
+        else:
+            valid_mask = ~padding_mask
 
         hidden_states = hidden_states * self.scale
-        valid_mask = ~padding_mask  # True = valid pooled token
 
         if self.standardize:
             hidden_states = (hidden_states - self.std_bias) * self.std_scale
