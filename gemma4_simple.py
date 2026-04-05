@@ -620,16 +620,18 @@ class VisionAttention(nn.Module):
         D = cfg.hidden_size
         self.num_heads = H
         self.head_dim  = Dh
-        self.scaling   = Dh ** -0.5
+        # HF Gemma4VisionAttention uses scaling=1.0, not 1/sqrt(head_dim)
+        self.scaling   = 1.0
 
         self.q_proj = nn.Linear(D, H * Dh, bias=False)
         self.k_proj = nn.Linear(D, H * Dh, bias=False)
         self.v_proj = nn.Linear(D, H * Dh, bias=False)
         self.o_proj = nn.Linear(H * Dh, D, bias=False)
 
-        self.q_norm = RMSNorm(Dh, eps=cfg.rms_norm_eps)
-        self.k_norm = RMSNorm(Dh, eps=cfg.rms_norm_eps)
-        self.v_norm = RMSNorm(Dh, eps=cfg.rms_norm_eps)
+        self.q_norm = RMSNorm(Dh, eps=cfg.rms_norm_eps, with_scale=True)
+        self.k_norm = RMSNorm(Dh, eps=cfg.rms_norm_eps, with_scale=True)
+        # v_norm has NO learnable scale (with_scale=False) — just bare normalisation
+        self.v_norm = RMSNorm(Dh, eps=cfg.rms_norm_eps, with_scale=False)
 
         self.rotary_emb = VisionRotaryEmbedding(Dh, cfg.rope_theta)
 
