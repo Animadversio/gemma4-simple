@@ -182,9 +182,15 @@ def patch_textmodel_layer_types(text_model, layer_types):
 def test_consistency():
     print("=" * 65)
     print("Gemma 4 E4B — forward pass consistency test")
+    print("(sequential loading to avoid OOM: HF first, then ours)")
     print("=" * 65)
 
-    # ── Load HF reference model ──────────────────────────────────
+    tokenizer = AutoTokenizer.from_pretrained(HF_CKPT)
+    prompts = ["The capital of France is", "def fibonacci(n):"]
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(DEVICE)
+    input_ids = inputs["input_ids"]
+
+    # ── Phase A: HF model → save logits → delete ─────────────────
     print("\n[1/4] Loading HF reference model (bf16)...")
     hf_model = HFGemma4.from_pretrained(
         HF_CKPT,
@@ -193,9 +199,23 @@ def test_consistency():
     )
     hf_model.eval()
     hf_cfg = hf_model.config
-    print(f"  HF model loaded on {DEVICE}.")
+    print(f"  HF model loaded. Running forward...")
 
-    # ── Build our model ──────────────────────────────────────────
+    hf_out    = hf_model.model.language_model(input_ids=input_ids)
+    hf_hidden = hf_out.last_hidden_state
+    hf_logits = hf_model.lm_head(hf_hidden)
+    if hf_cfg.text_config.final_logit_softcapping:
+        cap = hf_cfg.text_config.final_logit_softcapping
+        hf_logits = torch.tanh(hf_logits / cap) * cap
+    # Save to CPU before freeing GPU memory
+    hf_logits_cpu = hf_logits.float().cpu()
+    hf_top1_cpu   = hf_logits_cpu.argmax(-1)
+
+    print(f"  HF logits saved ({hf_logits_cpu.shape}). Freeing HF model...")
+    del hf_model, hf_out, hf_hidden, hf_logits
+    torch.cuda.empty_cache()
+
+    # ── Phase B: our model ────────────────────────────────────────
     print("\n[2/4] Building our model with matching config...")
     our_cfg = build_our_config(hf_cfg)
     our_model = Gemma4ForCausalLM(our_cfg)
@@ -204,53 +224,29 @@ def test_consistency():
     our_model.eval()
     print(f"  Our model built ({sum(p.numel() for p in our_model.parameters())/1e9:.2f}B params).")
 
-    # ── Load weights ─────────────────────────────────────────────
     print("\n[3/4] Loading weights from HF checkpoint...")
-    our_model = load_our_weights(
-        our_model,
-        HF_CKPT + "/model.safetensors"
-    )
+    our_model = load_our_weights(our_model, HF_CKPT + "/model.safetensors")
 
-    # ── Run forward on a real prompt ─────────────────────────────
-    print("\n[4/4] Running forward pass comparison...")
-    tokenizer = AutoTokenizer.from_pretrained(HF_CKPT)
-    prompts = [
-        "The capital of France is",
-        "def fibonacci(n):",
-    ]
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(DEVICE)
-    input_ids = inputs["input_ids"]
-
-    # HF forward (text-only path via language_model directly)
-    hf_out  = hf_model.model.language_model(input_ids=input_ids)
-    hf_hidden = hf_out.last_hidden_state
-    hf_logits = hf_model.lm_head(hf_hidden)
-    if hf_cfg.text_config.final_logit_softcapping:
-        cap = hf_cfg.text_config.final_logit_softcapping
-        hf_logits = torch.tanh(hf_logits / cap) * cap
-
-    # Our forward
-    our_out = our_model(input_ids)
-    our_logits = our_out["logits"]
+    print("\n[4/4] Running our forward pass...")
+    our_out    = our_model(input_ids)
+    our_logits = our_out["logits"].float().cpu()
 
     # ── Compare ───────────────────────────────────────────────────
-    print(f"\n  HF  logits shape: {hf_logits.shape}")
+    print(f"\n  HF  logits shape: {hf_logits_cpu.shape}")
     print(f"  Our logits shape: {our_logits.shape}")
 
-    # Align sequence length (HF may have different padding)
-    min_len = min(hf_logits.shape[1], our_logits.shape[1])
-    hf_l  = hf_logits[:, :min_len, :].float()
-    our_l = our_logits[:, :min_len, :].float()
+    min_len = min(hf_logits_cpu.shape[1], our_logits.shape[1])
+    hf_l  = hf_logits_cpu[:, :min_len, :]
+    our_l = our_logits[:, :min_len, :]
 
-    max_abs_diff = (hf_l - our_l).abs().max().item()
+    max_abs_diff  = (hf_l - our_l).abs().max().item()
     mean_abs_diff = (hf_l - our_l).abs().mean().item()
     cos_sim = F.cosine_similarity(
         hf_l.reshape(-1, hf_l.shape[-1]),
         our_l.reshape(-1, our_l.shape[-1]),
-        dim=-1
+        dim=-1,
     ).mean().item()
 
-    # Top-1 token agreement
     hf_top1  = hf_l.argmax(-1)
     our_top1 = our_l.argmax(-1)
     token_match = (hf_top1 == our_top1).float().mean().item()
@@ -262,7 +258,6 @@ def test_consistency():
     print(f"  │  Top-1 token match   : {token_match*100:>9.2f}%      │")
     print(f"  └─────────────────────────────────────────┘")
 
-    # Show predicted tokens for the last position
     print("\n  Predicted next tokens (last position):")
     for i, prompt in enumerate(prompts):
         hf_tok  = tokenizer.decode(hf_top1[i, -1])
