@@ -573,19 +573,28 @@ class TextModel(nn.Module):
         self._num_layers = N
         self._per_layer_dim = Dp
 
-    def _compute_per_layer_inputs(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor) -> Optional[torch.Tensor]:
-        """Compute [B, L, N, Dp] per-layer inputs matching HF's projection chain."""
+    def _get_per_layer_embed(self, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
+        """Token-embedding part only — [B, L, N, Dp]. No projection yet."""
         if self.embed_tokens_per_layer is None:
             return None
-        # Token embedding path
-        pli = self.embed_tokens_per_layer(input_ids).reshape(
+        return self.embed_tokens_per_layer(input_ids).reshape(
             *input_ids.shape, self._num_layers, self._per_layer_dim
-        )  # [B, L, N, Dp]
-        # Projection of main embeddings
+        )
+
+    def _project_per_layer(self, inputs_embeds: torch.Tensor,
+                            embed_part: torch.Tensor) -> torch.Tensor:
+        """Add the inputs_embeds projection to embed_part and scale. → [B, L, N, Dp]."""
         proj = self.per_layer_model_projection(inputs_embeds) * self.per_layer_model_projection_scale
         proj = proj.reshape(*inputs_embeds.shape[:-1], self._num_layers, self._per_layer_dim)
-        proj = self.per_layer_projection_norm(proj)  # [B, L, N, Dp]
-        return (proj + pli) * self.per_layer_input_scale
+        proj = self.per_layer_projection_norm(proj)
+        return (proj + embed_part) * self.per_layer_input_scale
+
+    def _compute_per_layer_inputs(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor) -> Optional[torch.Tensor]:
+        """Compute [B, L, N, Dp] per-layer inputs (text-only path)."""
+        embed = self._get_per_layer_embed(input_ids)
+        if embed is None:
+            return None
+        return self._project_per_layer(inputs_embeds, embed)
 
     def forward(
         self,
@@ -1005,9 +1014,12 @@ class Gemma4Model(nn.Module):
         text_ids[image_mask] = self.language_model.embed_tokens.padding_idx
         inputs_embeds = self.language_model.embed_tokens(text_ids)  # [B, L, D_text]
 
-        # Compute per-layer inputs from the text-only ids (before merging images)
-        if per_layer_inputs is None and self.language_model.embed_tokens_per_layer is not None:
-            per_layer_inputs = self.language_model._compute_per_layer_inputs(text_ids, inputs_embeds)
+        # Get token-embedding part of per-layer inputs BEFORE merging images
+        # (image positions use pad_id → correct token embedding lookup)
+        if per_layer_inputs is None:
+            pli_embed = self.language_model._get_per_layer_embed(text_ids)
+        else:
+            pli_embed = None  # caller provided fully-projected per_layer_inputs
 
         # Encode images and merge soft-tokens into placeholder positions
         if pixel_values is not None and pixel_position_ids is not None:
@@ -1017,6 +1029,11 @@ class Gemma4Model(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(
                 img_mask_exp, soft_tokens.to(inputs_embeds.dtype)
             )
+
+        # Project per-layer inputs using MERGED embeddings (image features at image positions),
+        # matching HF's Gemma4Model which calls project_per_layer_inputs after merging.
+        if pli_embed is not None:
+            per_layer_inputs = self.language_model._project_per_layer(inputs_embeds, pli_embed)
 
         return self.language_model(
             inputs_embeds=inputs_embeds,

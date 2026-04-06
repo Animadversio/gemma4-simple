@@ -597,7 +597,7 @@ def compare_system_multimodal() -> bool:
     # ── HF Gemma4Model ────────────────────────────────────────────
     print("  Running HF Gemma4Model…")
     hf_model = HFGemma4Model(hf_cfg).to(DTYPE).to(DEVICE)
-    hf_state = {k.replace("model.", ""): v for k, v in all_wts.items()}
+    hf_state = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in all_wts.items()}
     hf_model.load_state_dict(hf_state, strict=False)
     hf_model.eval()
 
