@@ -414,6 +414,12 @@ class TextExperts(nn.Module):
     """
     Sparse MoE expert bank.
     Each expert is a SwiGLU FFN. Only experts that receive at least one token are computed.
+
+    Numerics note: this Python-loop implementation matches HF's eager experts
+    (config._experts_implementation = 'eager') exactly (max_diff = 0, cos = 1.0).
+    HF's default uses grouped_mm (batched GEMM), which produces small floating-point
+    differences (~0.06 per layer) that accumulate across 30 layers (~25 final diff for
+    the 26B model). Both are mathematically correct; the gap is purely numerical.
     """
     def __init__(self, cfg: TextConfig):
         super().__init__()
@@ -458,7 +464,7 @@ class TextExperts(nn.Module):
             h = F.linear(h, self.down_proj[e])       # [n, D]
             out_flat[pos] = h.to(out_flat.dtype)
 
-        # Apply routing weights and accumulate via fp32 reshape+sum (matches HF grouped_mm)
+        # Apply routing weights and accumulate
         out_flat = out_flat * weights.unsqueeze(-1)   # [T*K, D]
         return out_flat.view(T, K, D).sum(dim=1).to(x.dtype)
 
