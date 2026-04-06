@@ -60,7 +60,7 @@ def check(name, ref, ours, atol=1.0, min_cos=0.99):
 
 
 def make_hf_cfg(hidden_size=64, num_layers=2, num_experts=4, top_k=2, moe_dim=24,
-                vocab_size=512, heads=4, kv_heads=2, head_dim=16, global_head_dim=32,
+                vocab_size=512, heads=4, kv_heads=2, head_dim=16, global_head_dim=16,
                 intermediate_size=128, num_kv_shared=0, sliding_window=64):
     """Build a tiny HF Gemma4TextConfig with MoE enabled."""
     layer_types = ["sliding_attention", "full_attention"] * (num_layers // 2)
@@ -102,6 +102,7 @@ def make_hf_cfg(hidden_size=64, num_layers=2, num_experts=4, top_k=2, moe_dim=24
         final_logit_softcapping=None,
         tie_word_embeddings=False,
         max_position_embeddings=8192,
+        _attn_implementation="eager",
     )
 
 
@@ -119,7 +120,7 @@ def make_our_cfg(hf_cfg: Gemma4TextConfig) -> TextConfig:
     else:
         kv_share_from = None
 
-    return TextConfig(
+    cfg = TextConfig(
         vocab_size=hf_cfg.vocab_size,
         hidden_size=hf_cfg.hidden_size,
         intermediate_size=hf_cfg.intermediate_size,
@@ -133,7 +134,7 @@ def make_our_cfg(hf_cfg: Gemma4TextConfig) -> TextConfig:
         embed_scale=hf_cfg.hidden_size ** 0.5,
         hidden_size_per_layer_input=hf_cfg.hidden_size_per_layer_input,
         sliding_window=hf_cfg.sliding_window,
-        sliding_window_pattern=6,  # irrelevant for mini tests
+        sliding_window_pattern=6,  # fallback; _layer_types takes precedence
         kv_share_from=kv_share_from,
         rope_local_base_freq=hf_cfg.rope_parameters["sliding_attention"]["rope_theta"],
         rope_global_base_freq=hf_cfg.rope_parameters["full_attention"]["rope_theta"],
@@ -144,6 +145,10 @@ def make_our_cfg(hf_cfg: Gemma4TextConfig) -> TextConfig:
         moe_layers=moe_layers,
         expert_intermediate_size=hf_cfg.moe_intermediate_size or 0,
     )
+    # Set _layer_types so TextModel/TextAttention use the exact HF layer type list
+    # instead of the sliding_window_pattern fallback
+    cfg._layer_types = hf_cfg.layer_types
+    return cfg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,39 +156,21 @@ def make_our_cfg(hf_cfg: Gemma4TextConfig) -> TextConfig:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def copy_router_weights(hf_router: Gemma4TextRouter, our_router: TextRouter):
-    """Copy HF router weights into ours.
-
-    Differences handled here:
-      - HF has router.norm with NO weight (with_scale=False).
-        Ours has router.norm.weight (initialized to ones). We leave ours as ones.
-      - HF has router.scale = nn.Parameter(shape=[D]). Ours uses a fixed scalar.
-        We CANNOT load this — it's silently absent in ours. Noted as Bug #1 / Bug #2.
-    """
-    # proj weights match exactly
+    """Copy HF router weights into ours (now fully compatible after Bug #1/#2 fixes)."""
     our_router.proj.weight.data.copy_(hf_router.proj.weight.data)
-    # per_expert_scale matches
     our_router.per_expert_scale.data.copy_(hf_router.per_expert_scale.data)
-    # NOTE: hf_router.scale (learned vector) is NOT copied — ours has no equivalent
-    # NOTE: our_router.norm.weight stays as ones; HF has no such parameter
+    our_router.scale.data.copy_(hf_router.scale.data)  # Bug #1 fixed: now have .scale param
+    # Bug #2 fixed: our norm now has with_scale=False, no .weight param to copy
 
 
 def copy_expert_weights(hf_experts: Gemma4TextExperts, our_experts: TextExperts):
-    """Copy HF expert weights into ours, transposing weight matrices.
+    """Copy HF expert weights into ours (now same layout after Bug #3 fix, no transpose needed).
 
-    HF layout:  gate_up_proj [E, 2*Di, D]   down_proj [E, D, Di]
-    Ours layout: gate_up_proj [E, D, 2*Di]   down_proj [E, Di, D]
-
-    HF uses F.linear(x, W) = x @ W.T  →  equivalent to x @ W^T
-    Ours uses  h @ W  directly
-
-    To match: our_W must equal hf_W.T, i.e. permute(0,2,1).
+    Both HF and ours now use: gate_up_proj [E, 2*Di, D]  down_proj [E, D, Di]
+    Both use F.linear(x, W) = x @ W.T
     """
-    our_experts.gate_up_proj.data.copy_(
-        hf_experts.gate_up_proj.data.permute(0, 2, 1)  # [E,2Di,D] → [E,D,2Di]
-    )
-    our_experts.down_proj.data.copy_(
-        hf_experts.down_proj.data.permute(0, 2, 1)     # [E,D,Di]  → [E,Di,D]
-    )
+    our_experts.gate_up_proj.data.copy_(hf_experts.gate_up_proj.data)
+    our_experts.down_proj.data.copy_(hf_experts.down_proj.data)
 
 
 def copy_decoder_layer_weights(hf_layer: Gemma4TextDecoderLayer,
@@ -283,20 +270,7 @@ def test_moe_experts(device, dtype):
         hf_out  = hf_exp(x.clone(),  top_k_index, top_k_weights)
         our_out = our_exp(x.clone(), top_k_index, top_k_weights)
 
-    ok = check("experts output (with transposed weights)", hf_out, our_out, atol=1e-3, min_cos=0.9999)
-
-    if not ok:
-        print()
-        print("  BUG #3 — Expert weight matrix layout is transposed:")
-        print(f"    HF:   gate_up_proj [{E}, 2*{Di}, {D}], uses F.linear(x, W) = x @ W.T")
-        print(f"    Ours: gate_up_proj [{E}, {D}, 2*{Di}], uses h @ W   (direct matmul)")
-        print("    Fix: when loading from checkpoint, permute(0,2,1) on gate_up_proj and down_proj")
-    else:
-        print("  Expert weights match after transposition fix  ✓")
-
-    # Document: naive copy without transpose fails due to shape mismatch
-    print(f"  (Naive copy without transpose: HF gate_up_proj {tuple(hf_exp.gate_up_proj.shape)} "
-          f"vs ours {tuple(our_exp.gate_up_proj.shape)} — would need permute(0,2,1))")
+    check("experts output (same layout, direct copy)", hf_out, our_out, atol=1e-3, min_cos=0.9999)
 
 
 def test_moe_decoder_layer(device, dtype):
@@ -307,6 +281,11 @@ def test_moe_decoder_layer(device, dtype):
     layer_idx = 0  # sliding_attention layer
     hf_layer  = Gemma4TextDecoderLayer(hf_cfg, layer_idx).to(device, dtype).eval()
     our_layer = TextDecoderLayer(our_cfg, layer_idx).to(device, dtype).eval()
+
+    # HF uses torch.empty for expert weights → NaN by default; reinitialize before copying
+    with torch.no_grad():
+        torch.nn.init.normal_(hf_layer.experts.gate_up_proj, std=0.02)
+        torch.nn.init.normal_(hf_layer.experts.down_proj, std=0.02)
 
     skipped = copy_decoder_layer_weights(hf_layer, our_layer)
     if skipped:
@@ -319,26 +298,27 @@ def test_moe_decoder_layer(device, dtype):
     x = torch.randn(B, L, D, device=device, dtype=dtype)
     # Build a minimal causal mask (all zeros = no masking for this test)
     mask = torch.zeros(B, 1, L, L, device=device, dtype=dtype)
-    # RoPE position embeddings
+    # RoPE position embeddings — layer_type goes to forward(), not constructor
     from transformers.models.gemma4.modeling_gemma4 import Gemma4TextRotaryEmbedding
+    lt = hf_cfg.layer_types[layer_idx]
     rope = Gemma4TextRotaryEmbedding(hf_cfg, device=device)
     pos_ids = torch.arange(L, device=device).unsqueeze(0)
-    pos_emb = rope(x, position_ids=pos_ids)
-    lt = hf_cfg.layer_types[layer_idx]
-    hf_cos, hf_sin = pos_emb[lt]
+    hf_cos, hf_sin = rope(x, position_ids=pos_ids, layer_type=lt)
 
-    # HF forward
+    # HF forward — position_embeddings is (cos, sin) tuple, mask is plain tensor
     with torch.no_grad():
         hf_out = hf_layer(
             x.clone(),
-            position_embeddings={lt: (hf_cos, hf_sin)},
-            attention_mask={lt: mask},
+            position_embeddings=(hf_cos, hf_sin),
+            attention_mask=mask,
         )
 
     # Our forward — build cos/sin from our rotary embedding
+    # HF uses "sliding_attention"/"full_attention"; ours uses "local"/"global"
+    our_lt = "local" if lt == "sliding_attention" else "global"
     from gemma4_simple import TextRotaryEmbedding
     our_rope = TextRotaryEmbedding(our_cfg).to(device)
-    our_cos, our_sin = our_rope(L, device, layer_type=lt)
+    our_cos, our_sin = our_rope(x, pos_ids, layer_type=our_lt)
     with torch.no_grad():
         our_out = our_layer(x.clone(), our_cos, our_sin, attention_mask=mask)
 
@@ -353,16 +333,19 @@ def test_moe_model(device, dtype):
     hf_model  = Gemma4TextModel(hf_cfg).to(device, dtype).eval()
     our_model = TextModel(our_cfg).to(device, dtype).eval()
 
-    # Copy all weights with transpositions for expert layers
+    # HF uses torch.empty for expert weights → NaN by default; reinitialize before copying
+    with torch.no_grad():
+        for layer in hf_model.layers:
+            if hasattr(layer, 'experts') and layer.experts is not None:
+                torch.nn.init.normal_(layer.experts.gate_up_proj, std=0.02)
+                torch.nn.init.normal_(layer.experts.down_proj, std=0.02)
+
+    # Copy all weights
     sd_hf  = hf_model.state_dict()
     sd_our = our_model.state_dict()
 
     loaded, skipped = {}, []
     for k, v in sd_hf.items():
-        # Expert weight transpositions
-        if "experts.gate_up_proj" in k or "experts.down_proj" in k:
-            # Transpose: HF [E, out, in] → ours [E, in, out]
-            v = v.permute(0, 2, 1)
         if k in sd_our and sd_our[k].shape == v.shape:
             sd_our[k] = v.clone()
             loaded[k] = True
@@ -379,11 +362,16 @@ def test_moe_model(device, dtype):
     B, L = 2, 16
     ids = torch.randint(2, hf_cfg.vocab_size, (B, L), device=device)
     ids[:, 0] = 2  # BOS
-    mask = torch.ones(B, L, device=device, dtype=torch.long)
+    mask_1d = torch.ones(B, L, device=device, dtype=torch.long)
+
+    # Build 4D causal mask for our model (HF builds this internally from mask_1d)
+    causal_4d = torch.full((B, 1, L, L), float("-inf"), device=device, dtype=dtype)
+    for i in range(L):
+        causal_4d[:, 0, i, :i + 1] = 0.0
 
     with torch.no_grad():
-        hf_out  = hf_model(ids, attention_mask=mask, use_cache=False).last_hidden_state
-        our_out = our_model(input_ids=ids)
+        hf_out  = hf_model(ids, attention_mask=mask_1d, use_cache=False).last_hidden_state
+        our_out = our_model(input_ids=ids, attention_mask=causal_4d)
 
     check("TextModel (MoE) last hidden state", hf_out, our_out, atol=2.0, min_cos=0.99)
 
@@ -459,18 +447,15 @@ def test_moe_full(ckpt: str, device, dtype):
                 note = f"  ← shape mismatch: ours={tuple(sd_our[k].shape)}"
             print(f"    {k:50s}  {str(tuple(v.shape)):20s}{note}")
 
-    # Test: load expert weights with correct transposition → compare outputs
+    # Load expert weights directly (no transpose needed — our layout now matches HF)
     from transformers.models.gemma4.modeling_gemma4 import Gemma4TextExperts as HFExperts
     hf_exp  = HFExperts(text_cfg_hf).to(device, dtype).eval()
     our_exp = TextExperts(our_cfg).to(device, dtype).eval()
 
-    # Load real expert weights into HF experts
     hf_exp.gate_up_proj.data.copy_(layer_weights["experts.gate_up_proj"].to(dtype))
     hf_exp.down_proj.data.copy_(layer_weights["experts.down_proj"].to(dtype))
-
-    # Load with transposition into ours
-    our_exp.gate_up_proj.data.copy_(layer_weights["experts.gate_up_proj"].to(dtype).permute(0, 2, 1))
-    our_exp.down_proj.data.copy_(layer_weights["experts.down_proj"].to(dtype).permute(0, 2, 1))
+    our_exp.gate_up_proj.data.copy_(layer_weights["experts.gate_up_proj"].to(dtype))
+    our_exp.down_proj.data.copy_(layer_weights["experts.down_proj"].to(dtype))
 
     T = 4
     x_flat = torch.randn(T, text_cfg_hf.hidden_size, device=device, dtype=dtype) * 0.1
@@ -483,38 +468,13 @@ def test_moe_full(ckpt: str, device, dtype):
         our_out_exp = our_exp(x_flat.clone(), top_k_index, top_k_weights)
 
     print()
-    check("Experts (real 26B weights, with transpose fix)", hf_out_exp, our_out_exp, atol=1e-2, min_cos=0.9999)
+    check("Experts (real 26B weights, direct load)", hf_out_exp, our_out_exp, atol=1e-2, min_cos=0.9999)
 
-    # Test WITHOUT transposition — same input, direct copy (will be wrong)
-    our_exp_bad = TextExperts(our_cfg).to(device, dtype).eval()
-    # Can't copy directly (shape mismatch), so transpose the HF weights the wrong way:
-    # Load as if we naively used the HF layout in our direct-matmul code
-    # Simulate: create expert with HF-layout weights and run our computation path
-    # We do this by manually swapping the dimensions
-    D, E = text_cfg_hf.hidden_size, text_cfg_hf.num_experts
-    Di = text_cfg_hf.moe_intermediate_size
-    # Build a "bad" expert: copy gate_up as [E, D, 2Di] but filled with the WRONG orientation
-    our_exp_bad.gate_up_proj.data.copy_(
-        layer_weights["experts.gate_up_proj"].to(dtype)[:, :D, :]  # truncate to wrong shape for demo
-        if False else
-        layer_weights["experts.gate_up_proj"].to(dtype).permute(0, 2, 1).transpose(1, 2).permute(0, 2, 1)
-        # = original HF layout transposed back = identity: just use original permutation
-    )
-    # Actually: the "bad" case is loading the weight WITHOUT transpose.
-    # Since shapes differ ([E,2Di,D] vs [E,D,2Di]), a direct load_state_dict would fail.
-    # We show this conceptually:
-    print(f"\n  Bug #3 confirmed on real weights:")
-    print(f"    HF gate_up_proj shape: {tuple(layer_weights['experts.gate_up_proj'].shape)}  [E, 2*Di, D]")
-    print(f"    Our gate_up_proj shape: {tuple(our_exp.gate_up_proj.shape)}             [E, D, 2*Di]")
-    print(f"    Direct load_state_dict would fail with shape mismatch → requires permute(0,2,1)")
-    print(f"\n  Bug #1 confirmed on real checkpoint:")
+    # Also verify router.scale loads correctly
     has_scale = "router.scale" in layer_weights
-    print(f"    router.scale present in checkpoint: {has_scale}")
     if has_scale:
-        scale_shape = tuple(layer_weights["router.scale"].shape)
-        scale_norm  = layer_weights["router.scale"].float().norm().item()
-        print(f"    router.scale shape={scale_shape}, norm={scale_norm:.4f} (not ones → learned)")
-        print(f"    Our TextRouter has no .scale parameter → this is silently ignored on load")
+        scale_norm = layer_weights["router.scale"].float().norm().item()
+        print(f"  router.scale norm={scale_norm:.4f} (from real checkpoint) — loaded into our .scale param")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -523,40 +483,19 @@ def test_moe_full(ckpt: str, device, dtype):
 
 KNOWN_DIFFS = """
 =================================================================
-  Known differences: gemma4_simple vs HuggingFace (MoE path)
+  MoE fix summary: gemma4_simple vs HuggingFace
 =================================================================
 
-BUG #1 — Router scale sign / magnitude:
-  HF:   norm(x) * learned_scale_vec(≈ones, shape=[D]) * D^(-0.5)
-  Ours: norm(x) * D^(+0.5)
-  Effect: router logits differ by factor ≈ D (hidden_size).
-  Fix:   add self.scale = nn.Parameter(torch.ones(D)) to TextRouter;
-         change forward to: h = self.norm(x) * self.scale * (D**-0.5)
+FIXED #1 — Router scale: now nn.Parameter(ones([D])) * D^(-0.5), matching HF exactly.
+FIXED #2 — Router norm: now RMSNorm(with_scale=False), no phantom .weight parameter.
+FIXED #3 — Expert weight layout: now [E, 2*Di, D] / [E, D, Di] (HF convention),
+           uses F.linear — direct load_state_dict works, no permute needed.
 
-BUG #2 — Router norm has no learnable weight in HF:
-  HF:   Gemma4RMSNorm(with_scale=False) → pure x/rms, no weight
-  Ours: RMSNorm always has learnable .weight (loaded from ckpt as ones)
-  Effect: with_scale=False norm is never in the checkpoint, so our
-          router.norm.weight is never loaded → stays ones → same numerics
-          as HF, but adds an unused parameter.
-  Fix:   add with_scale flag to RMSNorm; use RMSNorm(D, with_scale=False)
-         in TextRouter.__init__.
-
-BUG #3 — Expert weight matrix layout is transposed:
-  HF:   gate_up_proj [E, 2*Di, D]  down_proj [E, D, Di]
-        uses F.linear(x, W) = x @ W.T
-  Ours: gate_up_proj [E, D, 2*Di]  down_proj [E, Di, D]
-        uses h @ W (direct matmul)
-  Effect: wrong matrix multiplication → random output.
-  Fix (option A): when loading from checkpoint, permute(0,2,1).
-  Fix (option B): change TextExperts to use F.linear and match HF layout.
-
-BUG #4 — Config field name mismatches (26B → TextConfig remapping needed):
+NOTE #4 — Config field name remapping needed for 26B checkpoint loading:
   HF field              → Our field
   top_k_experts         → num_experts_per_tok
   moe_intermediate_size → expert_intermediate_size
   enable_moe_block=True → moe_layers=[0,...,N-1] (all layers)
-  (These are not bugs in the math, but must be handled during model loading.)
 =================================================================
 """
 

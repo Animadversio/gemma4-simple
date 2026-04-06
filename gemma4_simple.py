@@ -376,8 +376,11 @@ class TextRouter(nn.Module):
     def __init__(self, cfg: TextConfig):
         super().__init__()
         self.top_k = cfg.num_experts_per_tok
-        self.norm  = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.scale = cfg.hidden_size ** 0.5
+        # Bug #2 fix: HF uses RMSNorm with_scale=False (pure normalisation, no learnable weight)
+        self.norm  = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps, with_scale=False)
+        # Bug #1 fix: HF has a learned per-dim scale vector (NOT a scalar sqrt(D))
+        self.scale = nn.Parameter(torch.ones(cfg.hidden_size))
+        self._scale_factor = cfg.hidden_size ** -0.5
         # Projection to expert logits
         self.proj  = nn.Linear(cfg.hidden_size, cfg.num_experts, bias=False)
         # Per-expert learned output scale
@@ -385,7 +388,7 @@ class TextRouter(nn.Module):
 
     def forward(self, x: torch.Tensor):
         """x: [T, D]  (T = batch*seq flattened)"""
-        h = self.norm(x) * self.scale
+        h = self.norm(x) * self.scale * self._scale_factor
         logits = self.proj(h)                                   # [T, E]
         probs  = F.softmax(logits, dim=-1)                      # [T, E]
         top_w, top_idx = torch.topk(probs, self.top_k, dim=-1)  # [T, K]
@@ -404,9 +407,9 @@ class TextExperts(nn.Module):
         E  = cfg.num_experts
         D  = cfg.hidden_size
         Di = cfg.expert_intermediate_size
-        # Stacked weight matrices, one per expert
-        self.gate_up_proj = nn.Parameter(torch.empty(E, D, 2 * Di))
-        self.down_proj    = nn.Parameter(torch.empty(E, Di, D))
+        # Bug #3 fix: match HF weight layout [E, out, in] so checkpoint loads without permute
+        self.gate_up_proj = nn.Parameter(torch.empty(E, 2 * Di, D))
+        self.down_proj    = nn.Parameter(torch.empty(E, D, Di))
         nn.init.normal_(self.gate_up_proj, std=0.02)
         nn.init.normal_(self.down_proj,    std=0.02)
         self.num_experts = E
@@ -430,9 +433,9 @@ class TextExperts(nn.Module):
             e = idx[0].item()
             top_k_pos, token_idx = torch.where(expert_mask[e])  # which K-slot and which token
             h = x[token_idx]                                     # [n, D]
-            gate, up = (h @ self.gate_up_proj[e]).chunk(2, dim=-1)
+            gate, up = F.linear(h, self.gate_up_proj[e]).chunk(2, dim=-1)  # [n, 2Di] → split
             h = self.act(gate) * up
-            h = h @ self.down_proj[e]                            # [n, D]
+            h = F.linear(h, self.down_proj[e])                   # [n, D]
             h = h * top_k_weights[token_idx, top_k_pos, None]   # weighted by router
             out.index_add_(0, token_idx, h.to(out.dtype))
 
