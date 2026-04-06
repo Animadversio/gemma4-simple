@@ -78,6 +78,9 @@ class TextConfig:
     rope_global_base_freq: float = 1_000_000.0
     attn_logit_softcapping: float | None = None
     final_logit_softcapping: float | None = 30.0
+    # Global attention layers use a larger head_dim (e.g. 512 for E4B)
+    global_head_dim: int | None = None           # None → same as head_dim for all layers
+    global_partial_rotary_factor: float = 1.0    # fraction of global_head_dim to rotate
     # v_norm is only used when attention_k_eq_v=True (larger Gemma 4 variants)
     use_v_norm: bool = False
     # Per-layer input gate (Gemma4-specific)
@@ -110,6 +113,7 @@ class Gemma4Config:
     vision: VisionConfig = field(default_factory=VisionConfig)
     # Attention: 'bidirectional_vision' → vision tokens use bidirectional mask
     use_bidirectional_attention: str = "none"
+    image_token_id: int = 258_880   # sentinel id for image placeholder tokens
 
 
 # ──────────────────────────────────────────────────────────────
@@ -182,14 +186,42 @@ def apply_2d_rope(
 class TextRotaryEmbedding(nn.Module):
     """
     Dual-frequency RoPE for Gemma 4 text.
-    Local layers use rope_local_base_freq, global layers use rope_global_base_freq.
+    Local layers use rope_local_base_freq / head_dim.
+    Global layers use rope_global_base_freq / global_head_dim, with optional partial
+    rotation (partial_rotary_factor): only rope_angles = int(factor * global_head_dim // 2)
+    dimensions are rotated; the rest carry zero inv_freq (→ cos=1, sin=0 = identity).
+    Matches HF's _compute_proportional_rope_parameters exactly.
     """
     def __init__(self, cfg: TextConfig):
         super().__init__()
-        dim = cfg.head_dim
-        for name, base in [("local", cfg.rope_local_base_freq), ("global", cfg.rope_global_base_freq)]:
-            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-            self.register_buffer(f"{name}_inv_freq", inv_freq, persistent=False)
+        # Local (sliding attention) — full rotation over head_dim
+        local_dim = cfg.head_dim
+        local_inv_freq = 1.0 / (
+            cfg.rope_local_base_freq ** (torch.arange(0, local_dim, 2).float() / local_dim)
+        )
+        self.register_buffer("local_inv_freq", local_inv_freq, persistent=False)
+        self._local_head_dim = local_dim
+
+        # Global (full attention) — proportional/partial rotation over global_head_dim
+        global_dim = cfg.global_head_dim if cfg.global_head_dim is not None else cfg.head_dim
+        self._global_head_dim = global_dim
+        partial = getattr(cfg, "global_partial_rotary_factor", 1.0)
+        # rope_angles: number of (freq, freq) pairs that are actually rotated
+        rope_angles = int(partial * global_dim // 2)
+        # inv_freq for the rotated part: denominator is global_head_dim (matches HF)
+        rotated_inv = 1.0 / (
+            cfg.rope_global_base_freq
+            ** (torch.arange(0, 2 * rope_angles, 2).float() / global_dim)
+        )
+        # Pad the remaining nope dimensions with zero (identity: cos=1, sin=0)
+        nope_count = global_dim // 2 - rope_angles
+        if nope_count > 0:
+            global_inv_freq = torch.cat(
+                [rotated_inv, torch.zeros(nope_count)], dim=0
+            )
+        else:
+            global_inv_freq = rotated_inv
+        self.register_buffer("global_inv_freq", global_inv_freq, persistent=False)
 
     @torch.no_grad()
     def forward(
@@ -203,21 +235,23 @@ class TextRotaryEmbedding(nn.Module):
         inv_freq_exp = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
         pos_exp = position_ids[:, None, :].float()
         freqs = (inv_freq_exp.float() @ pos_exp.float()).transpose(1, 2)
+        # emb: [B, L, head_dim]  (first half and second half mirror each other)
         emb = torch.cat([freqs, freqs], dim=-1)
-        cos = emb.cos().to(x.dtype)
-        sin = emb.sin().to(x.dtype)
-        return cos, sin
+        return emb.cos().to(x.dtype), emb.sin().to(x.dtype)
 
 
 class ScaledEmbedding(nn.Embedding):
-    """Token embedding scaled by sqrt(hidden_size) as in Gemma."""
+    """Token embedding scaled by sqrt(hidden_size) as in Gemma.
+    The scale is stored as a float32 buffer and cast to the weight dtype at forward
+    time, matching HF's Gemma4TextScaledWordEmbedding exactly (important for bf16).
+    """
     def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int,
                  embed_scale: float = 1.0):
         super().__init__(num_embeddings, embedding_dim, padding_idx)
-        self.embed_scale = embed_scale
+        self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return super().forward(input_ids) * self.embed_scale
+        return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)
 
 
 class TextMLP(nn.Module):
@@ -245,30 +279,40 @@ class TextAttention(nn.Module):
         self.layer_idx = layer_idx
         self.num_heads = cfg.num_attention_heads
         self.num_kv_heads = cfg.num_key_value_heads
-        self.head_dim = cfg.head_dim
         self.is_kv_shared = is_kv_shared
-        # Sliding window: every sliding_window_pattern-th layer is global
-        self.sliding_window = (
-            None if (layer_idx % cfg.sliding_window_pattern == 0)
-            else cfg.sliding_window
+        # Use _layer_types if set (authoritative), otherwise fall back to pattern
+        _layer_types = getattr(cfg, "_layer_types", None)
+        is_global = (
+            _layer_types[layer_idx] == "full_attention"
+            if _layer_types is not None
+            else (layer_idx % cfg.sliding_window_pattern == 0)
+        )
+        self.sliding_window = None if is_global else cfg.sliding_window
+        # Global attention layers may use a larger head_dim
+        self.head_dim = (
+            cfg.global_head_dim if (is_global and cfg.global_head_dim is not None)
+            else cfg.head_dim
         )
 
         hs = cfg.hidden_size
         kv_dim = self.num_kv_heads * self.head_dim
 
         self.q_proj = nn.Linear(hs, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(hs, kv_dim, bias=False) if not is_kv_shared else None
-        self.v_proj = nn.Linear(hs, kv_dim, bias=False) if not is_kv_shared else None
+        # KV-shared layers still have k/v projections; sharing only applies with a KV cache
+        self.k_proj = nn.Linear(hs, kv_dim, bias=False)
+        self.v_proj = nn.Linear(hs, kv_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, hs, bias=False)
 
         # Per-head norms (applied before RoPE)
         self.q_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
-        # v_norm only exists when attention_k_eq_v=True (larger Gemma 4 models)
-        self.v_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps) if cfg.use_v_norm else None
+        # v_norm is always applied (no learnable scale by default).
+        # use_v_norm=True adds a learnable scale (for larger Gemma 4 variants).
+        self.v_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps, with_scale=cfg.use_v_norm)
 
         self.attn_logit_softcapping = cfg.attn_logit_softcapping
-        self.scaling = self.head_dim ** -0.5
+        # QK-norm (RMSNorm on q and k) is always applied, so scaling is 1.0, matching HF.
+        self.scaling = 1.0
 
     def forward(
         self,
@@ -288,15 +332,14 @@ class TextAttention(nn.Module):
         q = q.transpose(1, 2)  # [B, H, L, Dh]
 
         # ── Keys & Values ────────────────────────────────────────────────
-        if self.is_kv_shared and kv_cache is not None:
+        if self.is_kv_shared and kv_cache is not None and "shared_kv" in kv_cache:
             # Reuse the KV states stored by the designated anchor layer
             k, v = kv_cache["shared_kv"]
         else:
             k = self.k_proj(hidden_states).view(B, L, Hkv, Dh)
             v = self.v_proj(hidden_states).view(B, L, Hkv, Dh)
             k = self.k_norm(k)
-            if self.v_norm is not None:
-                v = self.v_norm(v)
+            v = self.v_norm(v)
             k = apply_rotary_pos_emb(k, cos, sin, unsqueeze_dim=2)
             k = k.transpose(1, 2)  # [B, Hkv, L, Dh]
             v = v.transpose(1, 2)
@@ -318,7 +361,8 @@ class TextAttention(nn.Module):
         if attention_mask is not None:
             attn = attn + attention_mask
 
-        attn = F.softmax(attn, dim=-1)
+        # Upcast to float32 for numerical stability (matches HF eager_attention_forward)
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(hidden_states.dtype)
         out = torch.matmul(attn, v)          # [B, H, L, Dh]
         out = out.transpose(1, 2).reshape(B, L, H * Dh)
         return self.o_proj(out)
@@ -506,21 +550,72 @@ class TextModel(nn.Module):
         self.layers = nn.ModuleList([TextDecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers)])
         self.norm   = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.sliding_window_pattern = cfg.sliding_window_pattern
+        self._layer_types = getattr(cfg, "_layer_types", None)
+
+        # Per-layer input gate embedding and projection chain (optional; E4B and larger).
+        # Matches HF Gemma4TextModel exactly:
+        #   embed_tokens_per_layer : Embedding(vocab, N*Dp), scaled by sqrt(Dp)
+        #   per_layer_model_projection : Linear(D, N*Dp), scaled by D**-0.5
+        #   per_layer_projection_norm  : RMSNorm(Dp)
+        #   per_layer_input_scale      : 2**-0.5 (constant)
+        Dp = cfg.hidden_size_per_layer_input
+        N  = cfg.num_hidden_layers
+        if Dp > 0:
+            self.embed_tokens_per_layer = ScaledEmbedding(
+                cfg.vocab_size, N * Dp, cfg.pad_token_id, embed_scale=Dp ** 0.5
+            )
+            self.per_layer_model_projection = nn.Linear(cfg.hidden_size, N * Dp, bias=False)
+            self.per_layer_model_projection_scale = cfg.hidden_size ** -0.5
+            self.per_layer_projection_norm = RMSNorm(Dp, eps=cfg.rms_norm_eps)
+            self.per_layer_input_scale = 2.0 ** -0.5
+        else:
+            self.embed_tokens_per_layer = None
+        self._num_layers = N
+        self._per_layer_dim = Dp
+
+    def _compute_per_layer_inputs(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor) -> Optional[torch.Tensor]:
+        """Compute [B, L, N, Dp] per-layer inputs matching HF's projection chain."""
+        if self.embed_tokens_per_layer is None:
+            return None
+        # Token embedding path
+        pli = self.embed_tokens_per_layer(input_ids).reshape(
+            *input_ids.shape, self._num_layers, self._per_layer_dim
+        )  # [B, L, N, Dp]
+        # Projection of main embeddings
+        proj = self.per_layer_model_projection(inputs_embeds) * self.per_layer_model_projection_scale
+        proj = proj.reshape(*inputs_embeds.shape[:-1], self._num_layers, self._per_layer_dim)
+        proj = self.per_layer_projection_norm(proj)  # [B, L, N, Dp]
+        return (proj + pli) * self.per_layer_input_scale
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[dict] = None,
+        per_layer_inputs: Optional[torch.Tensor] = None,  # [B, L, num_layers, Dp] if pre-computed
+        inputs_embeds: Optional[torch.Tensor] = None,     # pre-merged embeddings (multimodal)
     ) -> torch.Tensor:
-        x = self.embed_tokens(input_ids)                    # [B, L, D]
+        if inputs_embeds is None:
+            x = self.embed_tokens(input_ids)                # [B, L, D]
+        else:
+            x = inputs_embeds                               # [B, L, D], already embedded
+
         B, L, _ = x.shape
         position_ids = torch.arange(L, device=x.device).unsqueeze(0)  # [1, L]
 
+        # Compute per-layer inputs from input_ids when not provided externally
+        if per_layer_inputs is None and input_ids is not None and self.embed_tokens_per_layer is not None:
+            per_layer_inputs = self._compute_per_layer_inputs(input_ids, x)
+
         for i, layer in enumerate(self.layers):
-            layer_type = "local" if (i % self.sliding_window_pattern != 0) else "global"
+            if self._layer_types is not None:
+                layer_type = "local" if self._layer_types[i] == "sliding_attention" else "global"
+            else:
+                layer_type = "local" if (i % self.sliding_window_pattern != 0) else "global"
             cos, sin = self.rotary_emb(x, position_ids, layer_type=layer_type)
-            x = layer(x, cos, sin, attention_mask=attention_mask, kv_cache=kv_cache)
+            pli = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
+            x = layer(x, cos, sin, attention_mask=attention_mask,
+                      per_layer_input=pli, kv_cache=kv_cache)
 
         return self.norm(x)
 
@@ -871,7 +966,8 @@ class MultimodalEmbedder(nn.Module):
     """
     def __init__(self, vision_dim: int, text_dim: int, eps: float = 1e-6):
         super().__init__()
-        self.norm = RMSNorm(vision_dim, eps=eps)
+        # HF uses with_scale=False (no learnable weight, pure normalization)
+        self.norm = RMSNorm(vision_dim, eps=eps, with_scale=False)
         self.proj = nn.Linear(vision_dim, text_dim, bias=False)
 
     def forward(self, soft_tokens: torch.Tensor) -> torch.Tensor:
@@ -893,44 +989,40 @@ class Gemma4Model(nn.Module):
         self.language_model   = TextModel(cfg.text)
         self.vision_model     = VisionModel(cfg.vision)
         self.mm_embedder      = MultimodalEmbedder(cfg.vision.hidden_size, cfg.text.hidden_size)
-        self.image_token_id   = 255_999   # Gemma4 hard-codes this sentinel id
+        self.image_token_id = cfg.image_token_id
 
     def forward(
         self,
-        input_ids: torch.Tensor,                          # [B, L]
-        pixel_values: Optional[torch.Tensor] = None,      # [B, N, patch_dim]
+        input_ids: torch.Tensor,                           # [B, L]
+        pixel_values: Optional[torch.Tensor] = None,       # [B, N, patch_dim]
         pixel_position_ids: Optional[torch.Tensor] = None, # [B, N, 2]
         attention_mask: Optional[torch.Tensor] = None,
+        per_layer_inputs: Optional[torch.Tensor] = None,   # [B, L, N, Dp] pre-computed
     ) -> torch.Tensor:
-        # Embed text tokens; mask image placeholders with pad_id temporarily
+        # Embed text tokens; replace image placeholders with pad_id for embedding
         image_mask = (input_ids == self.image_token_id)  # [B, L]
-        safe_ids   = input_ids.clone()
-        safe_ids[image_mask] = self.language_model.embed_tokens.padding_idx
-        inputs_embeds = self.language_model.embed_tokens(safe_ids)  # [B, L, D_text]
+        text_ids = input_ids.clone()
+        text_ids[image_mask] = self.language_model.embed_tokens.padding_idx
+        inputs_embeds = self.language_model.embed_tokens(text_ids)  # [B, L, D_text]
 
-        # Encode images and scatter soft-tokens into placeholder positions
+        # Compute per-layer inputs from the text-only ids (before merging images)
+        if per_layer_inputs is None and self.language_model.embed_tokens_per_layer is not None:
+            per_layer_inputs = self.language_model._compute_per_layer_inputs(text_ids, inputs_embeds)
+
+        # Encode images and merge soft-tokens into placeholder positions
         if pixel_values is not None and pixel_position_ids is not None:
-            soft_tokens = self.vision_model(pixel_values, pixel_position_ids)   # [M, D_vision]
-            soft_tokens = self.mm_embedder(soft_tokens)                         # [M, D_text]
+            soft_tokens = self.vision_model(pixel_values, pixel_position_ids)  # [M, D_vision]
+            soft_tokens = self.mm_embedder(soft_tokens)                        # [M, D_text]
+            img_mask_exp = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(
+                img_mask_exp, soft_tokens.to(inputs_embeds.dtype)
+            )
 
-            # Scatter: fill image placeholder slots with soft tokens
-            flat_mask   = image_mask.reshape(-1)
-            flat_embeds = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
-            flat_embeds[flat_mask] = soft_tokens.to(flat_embeds.dtype)
-            inputs_embeds = flat_embeds.reshape(inputs_embeds.shape)
-
-        # Run language model (pass inputs_embeds directly, bypassing embed layer)
-        # For simplicity we call layers manually here
-        x = inputs_embeds
-        B, L, _ = x.shape
-        position_ids = torch.arange(L, device=x.device).unsqueeze(0)
-
-        for i, layer in enumerate(self.language_model.layers):
-            layer_type = "local" if (i % self.language_model.sliding_window_pattern != 0) else "global"
-            cos, sin = self.language_model.rotary_emb(x, position_ids, layer_type=layer_type)
-            x = layer(x, cos, sin, attention_mask=attention_mask)
-
-        return self.language_model.norm(x)   # [B, L, D_text]
+        return self.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            per_layer_inputs=per_layer_inputs,
+        )
 
 
 class Gemma4ForCausalLM(nn.Module):
