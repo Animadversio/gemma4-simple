@@ -78,10 +78,13 @@ class TextConfig:
     rope_global_base_freq: float = 1_000_000.0
     attn_logit_softcapping: float | None = None
     final_logit_softcapping: float | None = 30.0
-    # Global attention layers use a larger head_dim (e.g. 512 for E4B)
+    # Global attention layers use a larger head_dim and may have different KV head count
     global_head_dim: int | None = None           # None → same as head_dim for all layers
     global_partial_rotary_factor: float = 1.0    # fraction of global_head_dim to rotate
-    # v_norm is only used when attention_k_eq_v=True (larger Gemma 4 variants)
+    num_global_key_value_heads: int | None = None  # None → same as num_key_value_heads
+    # attention_k_eq_v=True: full-attention layers share K/V projection (v_proj=None, V=k_proj(x))
+    # use_v_norm applies v_norm regardless; when attention_k_eq_v=True, v_norm is always applied
+    attention_k_eq_v: bool = False
     use_v_norm: bool = False
     # Per-layer input gate (Gemma4-specific)
     hidden_size_per_layer_input: int = 0
@@ -278,7 +281,6 @@ class TextAttention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_heads = cfg.num_attention_heads
-        self.num_kv_heads = cfg.num_key_value_heads
         self.is_kv_shared = is_kv_shared
         # Use _layer_types if set (authoritative), otherwise fall back to pattern
         _layer_types = getattr(cfg, "_layer_types", None)
@@ -288,10 +290,15 @@ class TextAttention(nn.Module):
             else (layer_idx % cfg.sliding_window_pattern == 0)
         )
         self.sliding_window = None if is_global else cfg.sliding_window
-        # Global attention layers may use a larger head_dim
+        # Global attention layers may use a larger head_dim and different KV head count
         self.head_dim = (
             cfg.global_head_dim if (is_global and cfg.global_head_dim is not None)
             else cfg.head_dim
+        )
+        self.num_kv_heads = (
+            cfg.num_global_key_value_heads
+            if (is_global and cfg.num_global_key_value_heads is not None)
+            else cfg.num_key_value_heads
         )
 
         hs = cfg.hidden_size
@@ -300,14 +307,19 @@ class TextAttention(nn.Module):
         self.q_proj = nn.Linear(hs, self.num_heads * self.head_dim, bias=False)
         # KV-shared layers still have k/v projections; sharing only applies with a KV cache
         self.k_proj = nn.Linear(hs, kv_dim, bias=False)
-        self.v_proj = nn.Linear(hs, kv_dim, bias=False)
+        # attention_k_eq_v: full-attention layers share K projection for V (v_proj=None)
+        # In that case V = v_norm(k_proj(x)) (same input projection, different norm, no RoPE)
+        self.use_alternative_attention = cfg.attention_k_eq_v and is_global
+        self.v_proj = (
+            None if self.use_alternative_attention
+            else nn.Linear(hs, kv_dim, bias=False)
+        )
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, hs, bias=False)
 
         # Per-head norms (applied before RoPE)
         self.q_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
-        # v_norm is always applied (no learnable scale by default).
-        # use_v_norm=True adds a learnable scale (for larger Gemma 4 variants).
+        # v_norm: no learnable scale unless use_v_norm=True (4B+); always applied when k_eq_v
         self.v_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps, with_scale=cfg.use_v_norm)
 
         self.attn_logit_softcapping = cfg.attn_logit_softcapping
@@ -336,10 +348,11 @@ class TextAttention(nn.Module):
             # Reuse the KV states stored by the designated anchor layer
             k, v = kv_cache["shared_kv"]
         else:
-            k = self.k_proj(hidden_states).view(B, L, Hkv, Dh)
-            v = self.v_proj(hidden_states).view(B, L, Hkv, Dh)
-            k = self.k_norm(k)
-            v = self.v_norm(v)
+            k_raw = self.k_proj(hidden_states).view(B, L, Hkv, Dh)
+            # attention_k_eq_v: V uses the same raw k projection (before k_norm and RoPE)
+            v_raw = k_raw if self.use_alternative_attention else self.v_proj(hidden_states).view(B, L, Hkv, Dh)
+            k = self.k_norm(k_raw)
+            v = self.v_norm(v_raw)
             k = apply_rotary_pos_emb(k, cos, sin, unsqueeze_dim=2)
             k = k.transpose(1, 2)  # [B, Hkv, L, Dh]
             v = v.transpose(1, 2)

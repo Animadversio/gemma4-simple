@@ -129,6 +129,8 @@ def make_our_cfg(hf_cfg: Gemma4TextConfig) -> TextConfig:
         num_key_value_heads=hf_cfg.num_key_value_heads,
         head_dim=hf_cfg.head_dim,
         global_head_dim=hf_cfg.global_head_dim,
+        num_global_key_value_heads=getattr(hf_cfg, "num_global_key_value_heads", None),
+        attention_k_eq_v=getattr(hf_cfg, "attention_k_eq_v", False),
         rms_norm_eps=hf_cfg.rms_norm_eps,
         pad_token_id=hf_cfg.pad_token_id,
         embed_scale=hf_cfg.hidden_size ** 0.5,
@@ -481,6 +483,91 @@ def test_moe_full(ckpt: str, device, dtype):
 # Known differences summary
 # ─────────────────────────────────────────────────────────────────────────────
 
+def test_text_tower_26b(ckpt: str, dtype):
+    """Load full 26B text tower on CPU and compare a forward pass end-to-end.
+
+    The full model is ~52 GB — too large for a single 40GB A100 but fits easily
+    in the 1TB RAM available on this node.  We load HF Gemma4TextModel, copy all
+    weights into our TextModel, then compare outputs on a short sequence.
+
+    Strategy:
+      1. Load HF model on CPU with low_cpu_mem_usage=True
+      2. Copy every weight to our model (all should load cleanly after our fixes)
+      3. Delete HF model to free RAM
+      4. Run both on the same input (both on CPU, bf16)
+    """
+    import os
+    print(f"\n── 26B Full Text Tower (CPU, bfloat16) ─────────────────────────────────")
+    print(f"  ckpt={ckpt}")
+
+    cfg_path = os.path.join(ckpt, "config.json")
+    if not os.path.exists(cfg_path):
+        print("  ckpt not found — skipping")
+        return
+
+    from transformers import AutoConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel as HFTextModel
+
+    device = torch.device("cpu")
+
+    print("  Loading HF config...")
+    full_cfg = AutoConfig.from_pretrained(ckpt)
+    text_cfg_hf = full_cfg.text_config
+    text_cfg_hf._attn_implementation = "eager"
+
+    our_cfg = make_our_cfg(text_cfg_hf)
+
+    print("  Loading HF Gemma4TextModel (~52 GB, cpu, bfloat16)...")
+    hf_model = HFTextModel.from_pretrained(
+        ckpt, config=text_cfg_hf,
+        torch_dtype=dtype, low_cpu_mem_usage=True,
+    ).eval()
+    print(f"  HF model loaded ({sum(p.numel() for p in hf_model.parameters())/1e9:.1f}B params)")
+
+    print("  Building our TextModel and copying weights...")
+    our_model = TextModel(our_cfg).to(device, dtype).eval()
+
+    sd_hf  = hf_model.state_dict()
+    sd_our = our_model.state_dict()
+    n_loaded = n_skipped = 0
+    skipped = []
+    for k, v in sd_hf.items():
+        if k in sd_our and sd_our[k].shape == v.shape:
+            sd_our[k] = v.clone()
+            n_loaded += 1
+        else:
+            n_skipped += 1
+            skipped.append((k, tuple(v.shape), tuple(sd_our.get(k, torch.tensor([])).shape)))
+    our_model.load_state_dict(sd_our, strict=False)
+    print(f"  Loaded {n_loaded} tensors, skipped {n_skipped}")
+    if skipped:
+        for k, hs, os in skipped[:10]:
+            print(f"    {k}: HF={hs}  ours={os}")
+
+    # Free HF model RAM before running forward passes
+    del sd_hf
+    import gc; gc.collect()
+
+    B, L = 1, 16
+    ids = torch.randint(2, text_cfg_hf.vocab_size, (B, L), device=device)
+    ids[:, 0] = 2  # BOS
+    mask_1d = torch.ones(B, L, device=device, dtype=torch.long)
+
+    causal_4d = torch.full((B, 1, L, L), float("-inf"), device=device, dtype=dtype)
+    for i in range(L):
+        causal_4d[:, 0, i, :i + 1] = 0.0
+
+    print("  Running HF forward pass (cpu)...")
+    with torch.no_grad():
+        hf_out = hf_model(ids, attention_mask=mask_1d, use_cache=False).last_hidden_state
+
+    print("  Running our forward pass (cpu)...")
+    with torch.no_grad():
+        our_out = our_model(input_ids=ids, attention_mask=causal_4d)
+
+    check("26B TextModel full tower", hf_out, our_out, atol=2.0, min_cos=0.99)
+
+
 KNOWN_DIFFS = """
 =================================================================
   MoE fix summary: gemma4_simple vs HuggingFace
@@ -512,7 +599,7 @@ def main():
     parser.add_argument("--dtype",  default="bfloat16",
         choices=["bfloat16","float32"])
     parser.add_argument("--tests",  default="all",
-        help="Comma-separated: moe_router,moe_experts,moe_layer,moe_model,moe_full  or 'all'")
+        help="Comma-separated: moe_router,moe_experts,moe_layer,moe_model,moe_full,text_tower_26b  or 'all'")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -545,6 +632,10 @@ def main():
     if "moe_full" in requested:
         ckpt = args.ckpt or "/n/holylfs06/LABS/kempner_fellow_binxuwang/Users/binxuwang/huggingface/hub/gemma-4-26B-A4B-it"
         test_moe_full(ckpt, device, dtype)
+
+    if "text_tower_26b" in requested:
+        ckpt = args.ckpt or "/n/holylfs06/LABS/kempner_fellow_binxuwang/Users/binxuwang/huggingface/hub/gemma-4-26B-A4B-it"
+        test_text_tower_26b(ckpt, dtype)
 
     print()
     print(KNOWN_DIFFS)
