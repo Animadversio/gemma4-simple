@@ -39,6 +39,7 @@ Previously fixed bugs (now resolved, no longer present):
 """
 
 import argparse
+import os
 import sys
 import math
 import copy
@@ -57,7 +58,7 @@ from transformers.models.gemma4.modeling_gemma4 import (
 )
 
 # ── Our imports ───────────────────────────────────────────────────────────────
-sys.path.insert(0, "/n/home12/binxuwang/Github/gemma4-simple")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from gemma4_simple import TextConfig, TextRouter, TextExperts, TextDecoderLayer, TextModel
 
 # ─────────────────────────────────────────────────────────────────────────────
