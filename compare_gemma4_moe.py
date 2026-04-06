@@ -13,9 +13,27 @@ Usage:
   python compare_gemma4_moe.py --ckpt /path/26B    # also run moe_full
   python compare_gemma4_moe.py --tests moe_router   # single test
 
-Differences found vs HuggingFace (see KNOWN_DIFFS at bottom):
+Match conditions
+----------------
+All tests use _experts_implementation='eager' in the HF config (see make_hf_cfg and
+test_text_tower_26b).  Under this condition our Python-loop TextExperts is bit-exact
+vs HF:
+
+  HF eager  vs ours eager  → max_diff = 0.000,  cos_sim = 1.0  (bit-exact)
+
+HF's DEFAULT is _experts_implementation='grouped_mm', a fused batched-GEMM kernel.
+It computes the same math but with different bfloat16 accumulation order, producing:
+
+  HF grouped_mm vs ours eager → max_diff ≈ 25.75, cos_sim ≈ 0.961  (26B, 30 layers)
+
+This is NOT a bug — both are mathematically correct.  The discrepancy is ~0.063 per
+layer in bfloat16, amplified ~32× per layer by post-expert RMSNorm (ill-conditioned
+when expert output magnitude is small), compounding across all 30 MoE layers.
+In float32, the expert outputs are bit-identical regardless of implementation path.
+
+Previously fixed bugs (now resolved, no longer present):
   1. Router scale: ours fixed scalar D^0.5, HF learned vector * D^-0.5
-  2. Router norm: ours always has learnable weight, HF router norm with_scale=False
+  2. Router norm: ours always had learnable weight, HF router norm with_scale=False
   3. Experts weight layout: ours [E,D,2Di]/[E,Di,D], HF [E,2Di,D]/[E,D,Di] (transposed)
   4. Config fields: top_k_experts / moe_intermediate_size / enable_moe_block → need remapping
 """
@@ -575,7 +593,7 @@ def test_text_tower_26b(ckpt: str, dtype):
 
 KNOWN_DIFFS = """
 =================================================================
-  MoE fix summary: gemma4_simple vs HuggingFace
+  MoE implementation status: gemma4_simple vs HuggingFace
 =================================================================
 
 FIXED #1 — Router scale: now nn.Parameter(ones([D])) * D^(-0.5), matching HF exactly.
@@ -588,6 +606,21 @@ NOTE #4 — Config field name remapping needed for 26B checkpoint loading:
   top_k_experts         → num_experts_per_tok
   moe_intermediate_size → expert_intermediate_size
   enable_moe_block=True → moe_layers=[0,...,N-1] (all layers)
+
+NUMERICAL NOTE — Expert bfloat16 accumulation (NOT a bug):
+  HF default:  _experts_implementation='grouped_mm'  (fused batched GEMM kernel)
+  Our impl:    Python for-loop + F.linear             (same as HF 'eager' path)
+
+  In float32:  output is bit-identical regardless of implementation path.
+  In bfloat16: grouped_mm uses different accumulation order → ~0.063 diff per layer.
+               Amplified ~32x by post-expert RMSNorm → ~2.0 per layer → ~25.75 total
+               after 30 MoE layers.  cos_sim drops to ~0.961.
+
+  Fix for fair comparison:  set _experts_implementation='eager' on HF config.
+  All tests in this file already do this; see make_hf_cfg() and test_text_tower_26b().
+
+  Result with eager:  max_diff=0.000  cos_sim=1.000  (bit-exact, confirmed on 26B).
+  See DEBUGGING_NOTES.md for the full investigation.
 =================================================================
 """
 
