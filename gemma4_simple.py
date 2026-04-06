@@ -435,24 +435,32 @@ class TextExperts(nn.Module):
         top_k_weights: torch.Tensor, # [T, K]
     ) -> torch.Tensor:
         T, D = x.shape
-        out = torch.zeros_like(x)
+        K = top_k_index.shape[-1]
 
-        # One-hot expert mask [E, K, T]; iterate over experts that receive tokens
-        expert_mask = F.one_hot(top_k_index, self.num_experts)  # [T, K, E]
-        expert_mask = expert_mask.permute(2, 1, 0)              # [E, K, T]
-        active_experts = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=False)
+        # Expand token states for all (token, expert) pairs: [T*K, D]
+        token_idx = torch.arange(T, device=x.device).unsqueeze(1).expand(-1, K).reshape(-1)
+        expert_ids = top_k_index.reshape(-1)   # [T*K]
+        weights    = top_k_weights.reshape(-1) # [T*K]
+        selected   = x[token_idx]              # [T*K, D]
+
+        # Process each active expert; results stored at corresponding positions in out_flat
+        out_flat = torch.zeros_like(selected)  # [T*K, D]
+
+        expert_mask = F.one_hot(expert_ids, self.num_experts)  # [T*K, E]
+        active_experts = expert_mask.sum(0).nonzero(as_tuple=False)
 
         for idx in active_experts:
             e = idx[0].item()
-            top_k_pos, token_idx = torch.where(expert_mask[e])  # which K-slot and which token
-            h = x[token_idx]                                     # [n, D]
-            gate, up = F.linear(h, self.gate_up_proj[e]).chunk(2, dim=-1)  # [n, 2Di] → split
+            pos = expert_mask[:, e].bool()           # which T*K slots go to expert e
+            h = selected[pos]                        # [n, D]
+            gate, up = F.linear(h, self.gate_up_proj[e]).chunk(2, dim=-1)
             h = self.act(gate) * up
-            h = F.linear(h, self.down_proj[e])                   # [n, D]
-            h = h * top_k_weights[token_idx, top_k_pos, None]   # weighted by router
-            out.index_add_(0, token_idx, h.to(out.dtype))
+            h = F.linear(h, self.down_proj[e])       # [n, D]
+            out_flat[pos] = h.to(out_flat.dtype)
 
-        return out
+        # Apply routing weights and accumulate via fp32 reshape+sum (matches HF grouped_mm)
+        out_flat = out_flat * weights.unsqueeze(-1)   # [T*K, D]
+        return out_flat.view(T, K, D).sum(dim=1).to(x.dtype)
 
 
 class TextDecoderLayer(nn.Module):

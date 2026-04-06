@@ -103,6 +103,7 @@ def make_hf_cfg(hidden_size=64, num_layers=2, num_experts=4, top_k=2, moe_dim=24
         tie_word_embeddings=False,
         max_position_embeddings=8192,
         _attn_implementation="eager",
+        _experts_implementation="eager",  # avoid grouped_mm numerical differences
     )
 
 
@@ -514,6 +515,10 @@ def test_text_tower_26b(ckpt: str, dtype):
     full_cfg = AutoConfig.from_pretrained(ckpt)
     text_cfg_hf = full_cfg.text_config
     text_cfg_hf._attn_implementation = "eager"
+    # Force HF to use per-expert loop (vs grouped_mm) for fair numerical comparison.
+    # grouped_mm uses reshape+sum (fp32 accumulation) while our code uses index_add_ (bf16),
+    # causing ~0.96 cos_sim after 30 layers. With eager, they match bit-for-bit.
+    text_cfg_hf._experts_implementation = "eager"
 
     our_cfg = make_our_cfg(text_cfg_hf)
 
