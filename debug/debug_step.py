@@ -1,6 +1,6 @@
 """Step-by-step comparison: find the first point where HF and ours diverge."""
 import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import torch, torch.nn.functional as F
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer

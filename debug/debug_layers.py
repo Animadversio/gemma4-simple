@@ -3,7 +3,7 @@ Debug: run HF and our model layer-by-layer, compare at each step.
 Finds the first layer where outputs diverge.
 """
 import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import torch
 from safetensors import safe_open

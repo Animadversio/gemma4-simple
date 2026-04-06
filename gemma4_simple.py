@@ -441,32 +441,24 @@ class TextExperts(nn.Module):
         top_k_weights: torch.Tensor, # [T, K]
     ) -> torch.Tensor:
         T, D = x.shape
-        K = top_k_index.shape[-1]
+        out = torch.zeros_like(x)
 
-        # Expand token states for all (token, expert) pairs: [T*K, D]
-        token_idx = torch.arange(T, device=x.device).unsqueeze(1).expand(-1, K).reshape(-1)
-        expert_ids = top_k_index.reshape(-1)   # [T*K]
-        weights    = top_k_weights.reshape(-1) # [T*K]
-        selected   = x[token_idx]              # [T*K, D]
-
-        # Process each active expert; results stored at corresponding positions in out_flat
-        out_flat = torch.zeros_like(selected)  # [T*K, D]
-
-        expert_mask = F.one_hot(expert_ids, self.num_experts)  # [T*K, E]
-        active_experts = expert_mask.sum(0).nonzero(as_tuple=False)
+        # expert_mask[e, k, t] = 1 iff token t's k-th slot chose expert e
+        expert_mask = F.one_hot(top_k_index, self.num_experts)  # [T, K, E]
+        expert_mask = expert_mask.permute(2, 1, 0)              # [E, K, T]
+        active_experts = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=False)
 
         for idx in active_experts:
             e = idx[0].item()
-            pos = expert_mask[:, e].bool()           # which T*K slots go to expert e
-            h = selected[pos]                        # [n, D]
+            top_k_pos, token_idx = torch.where(expert_mask[e])  # slots & tokens for expert e
+            h = x[token_idx]                                     # [n, D]
             gate, up = F.linear(h, self.gate_up_proj[e]).chunk(2, dim=-1)
             h = self.act(gate) * up
-            h = F.linear(h, self.down_proj[e])       # [n, D]
-            out_flat[pos] = h.to(out_flat.dtype)
+            h = F.linear(h, self.down_proj[e])                   # [n, D]
+            h = h * top_k_weights[token_idx, top_k_pos, None]   # apply routing weights
+            out.index_add_(0, token_idx, h.to(out.dtype))
 
-        # Apply routing weights and accumulate
-        out_flat = out_flat * weights.unsqueeze(-1)   # [T*K, D]
-        return out_flat.view(T, K, D).sum(dim=1).to(x.dtype)
+        return out
 
 
 class TextDecoderLayer(nn.Module):

@@ -666,7 +666,7 @@ def setup(ckpt: str, device: str):
     """Load configs and build our config objects."""
     global HF_CKPT, DEVICE, hf_cfg, tc, vc, our_text_cfg, our_vis_cfg, tokenizer
     import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
     from gemma4_simple import TextConfig, VisionConfig
 
     HF_CKPT = ckpt

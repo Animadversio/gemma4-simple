@@ -13,6 +13,9 @@ Usage:
     python load_and_test.py
 """
 
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, Gemma4ForConditionalGeneration as HFGemma4
