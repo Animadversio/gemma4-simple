@@ -124,14 +124,28 @@ class Gemma4Config:
 # ──────────────────────────────────────────────────────────────
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (with optional learned scale)."""
+    r"""
+    ## Root Mean Square Layer Normalization
+
+    Unlike LayerNorm, RMSNorm omits the mean-centering step and normalises only
+    by the root-mean-square of the activations:
+
+    $$\text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{d}\sum_i x_i^2 + \epsilon}} \cdot w$$
+
+    where $w \in \mathbb{R}^d$ is a learned per-channel scale initialised to 1.
+
+    The computation is done in **float32** for numerical stability regardless of
+    the input dtype, then cast back — matching the HuggingFace implementation exactly.
+    Pass `with_scale=False` to get the scale-free variant used for $v$-normalisation
+    inside attention.
+    """
     def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim)) if with_scale else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Cast to float32 for numerical stability, then cast back
+        # Upcast to float32 for numerical stability, then cast back
         x_f = x.float()
         normed = x_f * torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.eps)
         if self.weight is not None:
@@ -140,7 +154,13 @@ class RMSNorm(nn.Module):
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Split last dim in two and rotate: [x1, x2] → [-x2, x1]."""
+    r"""
+    ## Rotary helper: rotate the second half into the first
+
+    Splits the last dimension into two halves $[x_1, x_2]$ and returns
+    $[-x_2, x_1]$. Combined with the cosine term this implements the
+    complex-number rotation $x \cdot e^{i\theta}$.
+    """
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat([-x2, x1], dim=-1)
@@ -152,7 +172,19 @@ def apply_rotary_pos_emb(
     sin: torch.Tensor,
     unsqueeze_dim: int = 1,
 ) -> torch.Tensor:
-    """Standard 1-D RoPE application."""
+    r"""
+    ## 1-D Rotary Position Embedding (RoPE)
+
+    Encodes absolute position into the query/key vectors by rotating pairs of
+    channels by a position-dependent angle $\theta_i \cdot m$ (where $m$ is
+    the token position and $\theta_i = \text{base}^{-2i/d}$):
+
+    $$x' = x \cos\theta + \text{rotate\_half}(x) \sin\theta$$
+
+    Because rotation is an isometry, the dot product $q \cdot k$ depends only
+    on the *relative* offset $m - n$, giving the model free relative-position
+    information without any learned parameters.
+    """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     return (x * cos) + (rotate_half(x) * sin)
@@ -165,10 +197,18 @@ def apply_2d_rope(
     position_ids: torch.Tensor,
     unsqueeze_dim: int = 2,
 ) -> torch.Tensor:
-    """
-    2-D RoPE for vision patches.
-    cos/sin have shape [B, L, 2 * (head_dim // 2)] — the first half encodes x,
-    the second half encodes y. We split x's channels accordingly and rotate each half.
+    r"""
+    ## 2-D Rotary Position Embedding for Vision Patches
+
+    Vision patches have a 2-D grid position $(r, c)$. We encode both axes
+    independently by splitting the head channels into two equal halves and
+    applying 1-D RoPE with the row frequencies to the first half and column
+    frequencies to the second:
+
+    $$x'_{\text{row}} = \text{RoPE}(x_{:d/2},\ \theta_r),\quad
+      x'_{\text{col}} = \text{RoPE}(x_{d/2:},\ \theta_c)$$
+
+    `cos`/`sin` carry both sets of frequencies concatenated along the last dim.
     """
     ndim = position_ids.shape[-1]  # should be 2
     channels_per_dim = 2 * (x.shape[-1] // (2 * ndim))
@@ -258,7 +298,21 @@ class ScaledEmbedding(nn.Embedding):
 
 
 class TextMLP(nn.Module):
-    """SwiGLU dense FFN used in non-MoE and as the shared expert."""
+    r"""
+    ## SwiGLU Feed-Forward Network
+
+    A gated variant of the FFN where one linear branch acts as a *gate*:
+
+    $$\text{MLP}(x) = W_{\text{down}}\bigl(\text{GELU}(W_{\text{gate}}\, x) \odot W_{\text{up}}\, x\bigr)$$
+
+    The GELU gate (tanh approximation) selectively suppresses or amplifies
+    each dimension of the intermediate representation before the final
+    down-projection, giving the network a multiplicative, content-dependent
+    nonlinearity at essentially no parameter cost beyond the extra gate projection.
+
+    Used as the **dense shared FFN** that runs on every layer. In MoE layers it
+    runs *in parallel* with the sparse expert bank and both outputs are summed.
+    """
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
@@ -266,16 +320,42 @@ class TextMLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # GELU(gate) ⊙ up  →  down
         return self.down_proj(F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
 
 
 class TextAttention(nn.Module):
-    """
-    Grouped-Query Attention with:
-      • QK normalisation (separate RMSNorm on Q and K before RoPE)
-      • V normalisation
-      • KV sharing (some layers reuse KV states from a previous layer)
-      • Optional sliding-window mask
+    r"""
+    ## Grouped-Query Attention (GQA)
+
+    Standard scaled dot-product attention with several Gemma-4 twists:
+
+    $$\text{Attn}(Q,K,V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V$$
+
+    **QK-normalisation** — RMSNorm is applied to each query and key head *before*
+    RoPE. Because the norms are learnable scales, the effective temperature is
+    absorbed into the weights, so the scaling constant is $1.0$ rather than
+    $1/\sqrt{d_k}$.
+
+    **V-normalisation** — A scale-free RMSNorm is applied to values, stabilising
+    training in mixed-precision without introducing extra parameters.
+
+    **Grouped-Query Attention** — there are fewer KV heads than Q heads
+    ($H_{kv} < H_q$). Each KV head is shared across $H_q / H_{kv}$ query heads
+    via `expand + reshape` before the dot product.
+
+    **Local vs global layers** — layers at positions divisible by
+    `sliding_window_pattern` use *full* (global) attention; the rest apply a
+    causal sliding-window mask of size `sliding_window`, limiting each token to
+    attending only the nearest $W$ positions.
+
+    **KV sharing** — the last `num_kv_shared_layers` layers reuse the key/value
+    states computed by the layer just before the shared block starts, saving
+    memory without a significant quality drop.
+
+    **`attention_k_eq_v`** — in global layers of large models, $V$ is derived from
+    the *same* linear projection as $K$ (i.e. `v_proj = None` and $V = k\_proj(x)$
+    before `k_norm`). This halves the KV projection cost.
     """
     def __init__(self, cfg: TextConfig, layer_idx: int, is_kv_shared: bool = False):
         super().__init__()
@@ -382,9 +462,21 @@ class TextAttention(nn.Module):
 
 
 class TextRouter(nn.Module):
-    """
-    Top-k router for Mixture-of-Experts.
-    Selects top_k experts per token and returns normalised, per-expert-scaled weights.
+    r"""
+    ## MoE Token Router
+
+    Selects the $K$ best experts for each token and computes their routing weights.
+
+    For a token representation $x \in \mathbb{R}^D$:
+
+    1. **Normalise** — scale-free RMSNorm stabilises the router input.
+    2. **Scale** — element-wise multiply by a learned per-dimension scale
+       $s \in \mathbb{R}^D$, then multiply by $D^{-1/2}$.
+    3. **Logits** — linear projection to $E$ expert scores.
+    4. **Softmax** → top-$K$ selection → renormalise the top-$K$ weights to sum to 1.
+    5. **Per-expert scale** — multiply each weight by a learned scalar
+       $\alpha_e$ (one per expert, init 1), giving the model a way to globally
+       up- or down-weight specific experts during training.
     """
     def __init__(self, cfg: TextConfig):
         super().__init__()
@@ -411,14 +503,26 @@ class TextRouter(nn.Module):
 
 
 class TextExperts(nn.Module):
-    """
-    Sparse MoE expert bank.
-    Each expert is a SwiGLU FFN. Only experts that receive at least one token are computed.
+    r"""
+    ## Sparse Expert Bank (MoE)
 
-    Numerics: this index_add_ loop matches HF's eager experts exactly (max_diff=0, cos=1.0).
-    HF's default _experts_implementation=None also falls back to the same index_add_ loop.
-    Set _experts_implementation='grouped_mm' in the HF config to use batched GEMM instead;
-    that produces small FP accumulation differences (~25 max_diff for the 26B model).
+    Holds $E$ independent SwiGLU FFNs. For each token only the $K$ experts
+    selected by the router are evaluated — the rest are skipped entirely,
+    keeping compute proportional to $K/E$ of the full dense cost.
+
+    **Weight layout** — `gate_up_proj[e]` $\in \mathbb{R}^{2D_i \times D}$ and
+    `down_proj[e]` $\in \mathbb{R}^{D \times D_i}$ are stacked along the first
+    dimension so that loading a single expert is a single tensor slice.
+
+    **Dispatch loop** — we build an `[E, K, T]` one-hot mask, iterate only over
+    *active* experts (those that received ≥ 1 token), gather the relevant token
+    vectors, run the SwiGLU FFN, and scatter-add results back via `index_add_`.
+
+    **Numerics note** — `index_add_` accumulates contributions in a deterministic
+    order (one token at a time), matching HuggingFace's eager implementation
+    bit-exactly in bfloat16. The alternative `grouped_mm` kernel accumulates in
+    a different order, producing ~0.06 diff per layer that grows to ~25 max_diff
+    over 30 layers (see `TEST_REPORT_26B_A4B.md`).
     """
     def __init__(self, cfg: TextConfig):
         super().__init__()
@@ -461,18 +565,37 @@ class TextExperts(nn.Module):
 
 
 class TextDecoderLayer(nn.Module):
-    """
-    One Gemma-4 transformer decoder layer.
+    r"""
+    ## Gemma 4 Transformer Decoder Layer
 
-    Architecture (see Gemma4TextDecoderLayer.forward in HF source):
-      1. Pre-norm → Attention → post-attn-norm → residual
-      2. Pre-FFN-norm → dense MLP always runs
-      3. If MoE layer:
-           MoE output added to MLP output (novel hybrid: both run in parallel)
-      4. Post-FFN-norm → residual
-      5. Optional per-layer input gate (small gating network conditioned on a
-         per-layer side input embedding)
-      6. Layer scalar: output multiplied by a learned per-layer scalar
+    Each layer runs the following sequence of operations:
+
+    **1. Self-Attention block**
+    $$h = x + \text{PostAttnNorm}\!\left(\text{Attn}\!\left(\text{PreNorm}(x)\right)\right)$$
+
+    **2. Dense MLP** (always active, even in MoE layers)
+    $$h_{\text{mlp}} = \text{MLP}\!\left(\text{PreFFNNorm}(h)\right)$$
+
+    **3. Sparse MoE** (only in MoE-designated layers; 26B model)
+
+    The dense MLP and the sparse expert bank run *in parallel* on the same
+    pre-FFN residual and their outputs are added:
+    $$h = h + \text{PostFFNNorm}\!\left(h_{\text{mlp}} + h_{\text{moe}}\right)$$
+
+    **4. Per-layer input gate** (E4B and larger models)
+
+    A lightweight gating network injects a *per-layer side-channel* $p_\ell$
+    (derived from the full token embeddings) at every layer:
+    $$h = h + \text{Norm}\!\left(W_{\text{proj}}\!\left(\text{GELU}(W_{\text{gate}}\,h) \odot p_\ell\right)\right)$$
+
+    This allows every layer to directly reference the original token context,
+    acting as a persistent residual information highway.
+
+    **5. Layer scalar**
+
+    The entire layer output is multiplied by a learned scalar $\lambda$ (init 1),
+    giving the optimiser a soft mechanism to reduce a layer's contribution early
+    in training.
     """
     def __init__(self, cfg: TextConfig, layer_idx: int):
         super().__init__()
@@ -561,7 +684,27 @@ class TextDecoderLayer(nn.Module):
 
 
 class TextModel(nn.Module):
-    """Stack of TextDecoderLayers with shared RoPE."""
+    r"""
+    ## Full Text Tower
+
+    Stacks $N$ `TextDecoderLayer`s with a shared `TextRotaryEmbedding` that
+    pre-computes $(cos, sin)$ tensors for the full input sequence length.
+
+    **Per-layer input pipeline** (E4B model, `hidden_size_per_layer_input > 0`):
+
+    Before the transformer runs, a compact *side-channel* tensor
+    $P \in \mathbb{R}^{B \times L \times N \times D_p}$ is computed by blending
+    two projections of the input:
+
+    $$P = \frac{1}{\sqrt{2}}\;\text{Norm}\!\left(\frac{W_{\text{proj}}\,x}{\sqrt{D}} + E_{\text{tok}}\right)$$
+
+    where $E_{\text{tok}}$ is a second token embedding table (scaled by $\sqrt{D_p}$).
+    The $\ell$-th slice $P_{:,:,\ell,:}$ is passed as `per_layer_input` to layer $\ell$.
+
+    When `inputs_embeds` is provided instead of `input_ids` (multimodal path), the
+    per-layer projection is computed from the *merged* embeddings (vision + text),
+    so image features influence the side-channel at every layer.
+    """
     def __init__(self, cfg: TextConfig):
         super().__init__()
         self.embed_tokens = ScaledEmbedding(
@@ -888,10 +1031,23 @@ class VisionEncoder(nn.Module):
 
 
 class VisionPooler(nn.Module):
-    """
-    Spatially average-pools patch features using pixel_position_ids to group
-    patches into k×k kernels (matches HF Gemma4VisionPooler exactly).
-    Scales by √hidden_size and strips padding tokens.
+    r"""
+    ## Vision Spatial Pooler
+
+    Reduces the $N$ patch tokens to $N / k^2$ *soft tokens* by averaging
+    each non-overlapping $k \times k$ block of patches (default $k = 3$, so
+    9 patches → 1 soft token):
+
+    $$\text{soft\_tok}_{(r',c')} = \frac{1}{k^2} \sum_{dr=0}^{k-1}\sum_{dc=0}^{k-1} h_{(kr'+dr,\, kc'+dc)}$$
+
+    The output is scaled by $\sqrt{D_v}$ before returning, matching the HF
+    implementation.  Padding tokens (indicated by `padding_positions`) are
+    masked out and stripped from the output so downstream layers see only
+    valid content.
+
+    This aggressive pooling is key to keeping the token count manageable:
+    a $336 \times 336$ image at patch size 16 gives $21 \times 21 = 441$ raw
+    patches, which pool down to $7 \times 7 = 49$ soft tokens.
     """
     def __init__(self, cfg: VisionConfig):
         super().__init__()
@@ -1005,14 +1161,35 @@ class MultimodalEmbedder(nn.Module):
 
 
 class Gemma4Model(nn.Module):
-    """
-    Multimodal backbone: merges image soft-tokens into the text token stream
-    then runs the language model.
+    r"""
+    ## Multimodal Backbone
 
-    Token stream layout (after image insertion):
-      [text tokens ... <img_placeholder> ... text tokens]
-                              ↑
-              replaced by projected vision soft-tokens
+    Fuses the vision and text towers into a single forward pass:
+
+    **Step 1 — Text embedding**
+    Token ids → `ScaledEmbedding` (with image placeholders replaced by `pad_id`
+    so the embedding table doesn't see the sentinel token).
+
+    **Step 2 — Vision encoding**
+    Raw patches → `VisionModel` (ViT encoder + spatial pooler) → $M$ soft tokens
+    of shape $[M, D_v]$.  Then `MultimodalEmbedder` (LayerNorm + Linear) projects
+    them to text dimension $D$, producing $[M, D]$.
+
+    **Step 3 — Token stream merge**
+    Image placeholder positions in the embedding sequence are overwritten by the
+    projected soft tokens via `masked_scatter`:
+
+    $$e_i = \begin{cases} \text{soft\_tok}_j & \text{if } i \text{ is an image placeholder} \\ \text{text\_emb}_i & \text{otherwise} \end{cases}$$
+
+    **Step 4 — Per-layer side-channel**
+    The per-layer projection is computed from the *merged* embeddings (not the
+    original text-only ids), so vision features appear in $P_\ell$ for every layer.
+
+    **Step 5 — Language model**
+    The merged embedding sequence is passed through `TextModel` as normal.
+    Vision information reaches the transformer through *two routes*:
+    (a) directly as soft tokens in the input positions, and
+    (b) via the per-layer side-channel $P_\ell$ injected at every decoder layer.
     """
     def __init__(self, cfg: Gemma4Config):
         super().__init__()
