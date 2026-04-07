@@ -185,7 +185,7 @@ def apply_rotary_pos_emb(
     channels by a position-dependent angle $\theta_i \cdot m$ (where $m$ is
     the token position and $\theta_i = \text{base}^{-2i/d}$):
 
-    $$x' = x \cos\theta + \text{rotate\_half}(x) \sin\theta$$
+    $$x^\prime = x \cos\theta + \text{rotate\_half}(x) \sin\theta$$
 
     Because rotation is an isometry, the dot product $q \cdot k$ depends only
     on the *relative* offset $m - n$, giving the model free relative-position
@@ -211,8 +211,8 @@ def apply_2d_rope(
     applying 1-D RoPE with the row frequencies to the first half and column
     frequencies to the second:
 
-    $$x'_{\text{row}} = \text{RoPE}(x_{:d/2},\ \theta_r),\quad
-      x'_{\text{col}} = \text{RoPE}(x_{d/2:},\ \theta_c)$$
+    $$x^\prime_{\text{row}} = \text{RoPE}(x_{:d/2},\ \theta_r),\quad
+      x^\prime_{\text{col}} = \text{RoPE}(x_{d/2:},\ \theta_c)$$
 
     `cos`/`sin` carry both sets of frequencies concatenated along the last dim.
     """

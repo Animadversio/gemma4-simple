@@ -232,9 +232,13 @@ def parse_source(source: str) -> list[Section]:
             while i < len(lines) and re.match(r"^\s*@", lines[i].strip()):
                 def_line += lines[i]
                 i += 1
-            if i < len(lines) and not re.match(r"^\s*(class |def |async def )", def_line.strip()):
-                def_line += lines[i]
-                i += 1
+
+            # If the signature is multi-line (e.g. def foo(\n    x,\n    y,\n) -> T:)
+            # keep reading until the line that closes with ':'
+            if re.match(r"^\s*(def |async def |class )", def_line.lstrip()):
+                while i < len(lines) and not def_line.rstrip().rstrip("\\").endswith(":"):
+                    def_line += lines[i]
+                    i += 1
 
             # Check for docstring immediately after
             doc_for_def = ""
