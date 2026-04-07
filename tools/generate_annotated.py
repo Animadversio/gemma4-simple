@@ -37,7 +37,7 @@ from pygments.lexers import PythonLexer
 
 _PY_LEXER   = PythonLexer(stripnl=False)
 _PY_FMT     = HtmlFormatter(nowrap=True, style="dracula", wrapcode=False)
-_PY_CSS     = HtmlFormatter(style="dracula").get_style_defs(".code-hl")
+_PY_CSS     = HtmlFormatter(style="dracula").get_style_defs(".highlight")
 
 
 # ── Mistune Markdown renderer with LaTeX pass-through ─────────────────────────

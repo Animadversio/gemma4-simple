@@ -8,36 +8,42 @@ framework boilerplate so the architecture is easy to read and experiment with.
 Reference:
   https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py
 
-Modules implemented (in bottom-up order):
-  --- Shared primitives ---
-  RMSNorm
-  rotate_half / apply_rotary_pos_emb / apply_2d_rope
+## Modules implemented (bottom-up order)
 
-  --- Text tower ---
-  TextRotaryEmbedding
-  ScaledEmbedding
-  TextMLP          (SwiGLU dense FFN)
-  TextAttention    (GQA + QK-norm + sliding-window + KV-sharing)
-  TextRouter       (top-k MoE router)
-  TextExperts      (sparse expert FFN)
-  TextDecoderLayer (Attention + dense MLP + optional MoE + per-layer gate)
-  TextModel
+**Shared primitives**
 
-  --- Vision tower ---
-  VisionRotaryEmbedding   (2-D RoPE for patch (x,y) positions)
-  VisionPatchEmbedder
-  VisionMLP
-  VisionAttention         (ViT-style, 2-D RoPE, QKV norms)
-  VisionEncoderLayer
-  VisionEncoder
-  VisionPooler            (adaptive average pooling)
-  VisionModel
+* `RMSNorm` — root-mean-square layer normalisation
+* `rotate_half` / `apply_rotary_pos_emb` — 1-D RoPE helpers
+* `apply_2d_rope` — 2-D RoPE for vision patch grids
 
-  --- Multimodal fusion ---
-  MultimodalEmbedder      (project vision soft-tokens → text hidden size)
-  Gemma4Model             (merge image/video/audio slots into token stream)
-  Gemma4ForCausalLM       (text-only)
-  Gemma4ForConditionalGeneration  (full multimodal)
+**Text tower**
+
+* `TextRotaryEmbedding` — dual-frequency RoPE (local / global)
+* `ScaledEmbedding` — token embeddings scaled by √hidden_size
+* `TextMLP` — SwiGLU dense FFN
+* `TextAttention` — GQA + QK-norm + sliding-window + KV-sharing
+* `TextRouter` — top-k MoE router with per-expert scale
+* `TextExperts` — sparse expert FFN bank
+* `TextDecoderLayer` — full layer: Attention + MLP + optional MoE + per-layer gate
+* `TextModel` — stack of decoder layers with shared RoPE
+
+**Vision tower**
+
+* `VisionRotaryEmbedding` — 2-D RoPE for patch (x, y) positions
+* `VisionPatchEmbedder` — raw pixels → patch vectors
+* `VisionMLP` — SwiGLU FFN with optional activation clipping
+* `VisionAttention` — ViT-style full attention with 2-D RoPE and QKV norms
+* `VisionEncoderLayer` — single ViT layer
+* `VisionEncoder` — stack of ViT layers
+* `VisionPooler` — k×k spatial average pooling → soft tokens
+* `VisionModel` — patch embedder → encoder → pooler
+
+**Multimodal fusion**
+
+* `MultimodalEmbedder` — project vision soft-tokens → text hidden size
+* `Gemma4Model` — merge image soft-tokens into token stream, run language model
+* `Gemma4ForCausalLM` — text-only causal LM head
+* `Gemma4ForConditionalGeneration` — full multimodal generation model
 """
 
 from __future__ import annotations
@@ -273,12 +279,15 @@ class TextRotaryEmbedding(nn.Module):
         position_ids: torch.Tensor,
         layer_type: str = "global",   # "local" or "global"
     ):
+        # Select inv_freq table for this layer type (local=small base, global=large base)
         inv_freq = getattr(self, f"{layer_type}_inv_freq")
-        # [B, head_dim/2, 1] × [B, 1, L] → [B, L, head_dim/2]
+        # Outer product: inv_freq [D/2] × position [L] → [B, L, D/2]
+        # Each entry (b,l,i) = inv_freq[i] * position_ids[b,l]
         inv_freq_exp = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
         pos_exp = position_ids[:, None, :].float()
         freqs = (inv_freq_exp.float() @ pos_exp.float()).transpose(1, 2)
-        # emb: [B, L, head_dim]  (first half and second half mirror each other)
+        # Duplicate to get full head_dim: [cos(θ_0·m), …, cos(θ_{D/2}·m), cos(θ_0·m), …]
+        # This layout means the second half mirrors the first, enabling rotate_half
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos().to(x.dtype), emb.sin().to(x.dtype)
 
@@ -438,24 +447,30 @@ class TextAttention(nn.Module):
             v = v.transpose(1, 2)
 
         # ── GQA: expand KV heads to match Q heads ───────────────────────
+        # Each KV head is broadcast to H/Hkv query heads by inserting a repeat dim
         if Hkv != H:
             expand = H // Hkv
             k = k.unsqueeze(2).expand(-1, -1, expand, -1, -1).reshape(B, H, -1, Dh)
             v = v.unsqueeze(2).expand(-1, -1, expand, -1, -1).reshape(B, H, -1, Dh)
 
         # ── Scaled dot-product attention ────────────────────────────────
+        # scaling=1.0 because QK-norms already control the variance (no 1/√d needed)
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
 
+        # Optional logit soft-capping: tanh(logit/cap) * cap keeps logits in (-cap, cap)
+        # This prevents softmax collapse in very long contexts
         if self.attn_logit_softcapping is not None:
             attn = attn / self.attn_logit_softcapping
             attn = torch.tanh(attn)
             attn = attn * self.attn_logit_softcapping
 
+        # Causal / sliding-window mask: upper-triangle = -inf, recent window = 0
         if attention_mask is not None:
             attn = attn + attention_mask
 
-        # Upcast to float32 for numerical stability (matches HF eager_attention_forward)
+        # Upcast to float32 for numerically stable softmax (matches HF eager impl)
         attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(hidden_states.dtype)
+        # Weighted sum of values, merge heads, project back to hidden_size
         out = torch.matmul(attn, v)          # [B, H, L, Dh]
         out = out.transpose(1, 2).reshape(B, L, H * Dh)
         return self.o_proj(out)
@@ -544,22 +559,29 @@ class TextExperts(nn.Module):
         top_k_weights: torch.Tensor, # [T, K]
     ) -> torch.Tensor:
         T, D = x.shape
+        # Accumulator: we scatter expert outputs back into this tensor
         out = torch.zeros(T, D, dtype=x.dtype, device=x.device)
 
-        # [T, K, E] → [E, K, T] so we can iterate over experts (matches HF eager layout)
+        # Build a 3-way membership mask then transpose to expert-major order
+        # expert_mask[e, k, t] = 1  iff token t was assigned to expert e in slot k
         expert_mask = F.one_hot(top_k_index, self.num_experts)  # [T, K, E]
         expert_mask = expert_mask.permute(2, 1, 0)              # [E, K, T]
+        # Only iterate over experts that actually received tokens (skip dead experts)
         active_experts = (expert_mask.sum(dim=(1, 2)) > 0).nonzero(as_tuple=True)[0]
 
         for expert_idx in active_experts:
             e = expert_idx.item()
+            # Find which (k-slot, token) pairs are assigned to expert e
             k_slot, tok_idx = torch.where(expert_mask[e])   # [n], [n]
-            h = x[tok_idx]                                   # [n, D]
+            h = x[tok_idx]                                   # [n, D]  — gather tokens
+            # SwiGLU FFN for this expert (gate and up projections packed into one matrix)
             gate, up = F.linear(h, self.gate_up_proj[e]).chunk(2, dim=-1)
-            h = self.act(gate) * up
+            h = self.act(gate) * up                          # GELU gate
             h = F.linear(h, self.down_proj[e])               # [n, D]
-            h = h * top_k_weights[tok_idx, k_slot, None]     # apply routing weights
-            out.index_add_(0, tok_idx, h.to(out.dtype))      # accumulate
+            # Scale by routing weight (how much this expert contributes for this token)
+            h = h * top_k_weights[tok_idx, k_slot, None]
+            # index_add_: deterministic accumulation order → bit-exact with HF eager
+            out.index_add_(0, tok_idx, h.to(out.dtype))
 
         return out
 
@@ -768,28 +790,34 @@ class TextModel(nn.Module):
         per_layer_inputs: Optional[torch.Tensor] = None,  # [B, L, num_layers, Dp] if pre-computed
         inputs_embeds: Optional[torch.Tensor] = None,     # pre-merged embeddings (multimodal)
     ) -> torch.Tensor:
+        # Accept either token ids (text-only) or pre-built embeddings (multimodal path)
         if inputs_embeds is None:
             x = self.embed_tokens(input_ids)                # [B, L, D]
         else:
             x = inputs_embeds                               # [B, L, D], already embedded
 
         B, L, _ = x.shape
+        # Simple 0..L-1 position indices — causal order; no offset needed for prefill
         position_ids = torch.arange(L, device=x.device).unsqueeze(0)  # [1, L]
 
-        # Compute per-layer inputs from input_ids when not provided externally
+        # Compute the full per-layer side-channel P ∈ [B, L, N, Dp] once up front
+        # (text-only path; multimodal path pre-computes this with merged embeddings)
         if per_layer_inputs is None and input_ids is not None and self.embed_tokens_per_layer is not None:
             per_layer_inputs = self._compute_per_layer_inputs(input_ids, x)
 
         for i, layer in enumerate(self.layers):
+            # Alternate between local (sliding-window) and global RoPE frequencies
             if self._layer_types is not None:
                 layer_type = "local" if self._layer_types[i] == "sliding_attention" else "global"
             else:
                 layer_type = "local" if (i % self.sliding_window_pattern != 0) else "global"
             cos, sin = self.rotary_emb(x, position_ids, layer_type=layer_type)
+            # Slice the i-th layer's per-layer input vector — [B, L, Dp]
             pli = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
             x = layer(x, cos, sin, attention_mask=attention_mask,
                       per_layer_input=pli, kv_cache=kv_cache)
 
+        # Final RMSNorm before the output projection / logit head
         return self.norm(x)
 
 
@@ -1206,33 +1234,38 @@ class Gemma4Model(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         per_layer_inputs: Optional[torch.Tensor] = None,   # [B, L, N, Dp] pre-computed
     ) -> torch.Tensor:
-        # Embed text tokens; replace image placeholders with pad_id for embedding
+        # Locate image placeholder positions in the token sequence
         image_mask = (input_ids == self.image_token_id)  # [B, L]
+        # Replace placeholders with pad_id so the embedding table sees valid indices
         text_ids = input_ids.clone()
         text_ids[image_mask] = self.language_model.embed_tokens.padding_idx
         inputs_embeds = self.language_model.embed_tokens(text_ids)  # [B, L, D_text]
 
-        # Get token-embedding part of per-layer inputs BEFORE merging images
-        # (image positions use pad_id → correct token embedding lookup)
+        # Compute the token-embedding half of per-layer inputs BEFORE we overwrite
+        # the placeholder positions — image slots should use pad embedding, not vision
         if per_layer_inputs is None:
             pli_embed = self.language_model._get_per_layer_embed(text_ids)
         else:
             pli_embed = None  # caller provided fully-projected per_layer_inputs
 
-        # Encode images and merge soft-tokens into placeholder positions
+        # ── Vision path: encode pixels → soft tokens → inject into embedding sequence ──
         if pixel_values is not None and pixel_position_ids is not None:
-            soft_tokens = self.vision_model(pixel_values, pixel_position_ids)  # [M, D_vision]
-            soft_tokens = self.mm_embedder(soft_tokens)                        # [M, D_text]
+            # ViT encoder + k×k spatial pooler → [M, D_vision] soft tokens
+            soft_tokens = self.vision_model(pixel_values, pixel_position_ids)
+            # Linear projection to text hidden dimension → [M, D_text]
+            soft_tokens = self.mm_embedder(soft_tokens)
+            # Overwrite image placeholder embeddings with projected vision features
             img_mask_exp = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(
                 img_mask_exp, soft_tokens.to(inputs_embeds.dtype)
             )
 
-        # Project per-layer inputs using MERGED embeddings (image features at image positions),
-        # matching HF's Gemma4Model which calls project_per_layer_inputs after merging.
+        # Recompute the projection half using MERGED embeddings so that vision features
+        # appear in the per-layer side-channel P_ℓ passed to every decoder layer
         if pli_embed is not None:
             per_layer_inputs = self.language_model._project_per_layer(inputs_embeds, pli_embed)
 
+        # Run the full text tower with vision features baked into the embedding sequence
         return self.language_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
