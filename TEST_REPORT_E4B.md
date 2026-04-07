@@ -1,6 +1,6 @@
 # Test Report — Gemma 4 E4B (gemma4_simple vs HuggingFace)
 
-**Date:** 2026-04-06
+**Date:** 2026-04-06 (re-run confirmed post-refactor)
 **Model:** `gemma-4-E4B-it` (4B active / ~8.5B total parameters)
 **Checkpoint:** `/n/holylfs06/LABS/kempner_fellow_binxuwang/Users/binxuwang/huggingface/hub/gemma-4-E4B-it`
 **Hardware:** A100 40 GB, CUDA, bfloat16
