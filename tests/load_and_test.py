@@ -28,7 +28,7 @@ from gemma4_simple import (
     Gemma4ForCausalLM,
 )
 
-HF_CKPT = "/home/binxu/.cache/huggingface/hub/gemma-4-E4B-it"
+HF_CKPT = "/n/holylfs06/LABS/kempner_fellow_binxuwang/Users/binxuwang/huggingface/hub/gemma-4-E4B-it"
 DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
 
 

@@ -415,11 +415,11 @@ class TextExperts(nn.Module):
     Sparse MoE expert bank.
     Each expert is a SwiGLU FFN. Only experts that receive at least one token are computed.
 
-    Numerics note: this Python-loop implementation matches HF's eager experts
-    (config._experts_implementation = 'eager') exactly (max_diff = 0, cos = 1.0).
-    HF's default uses grouped_mm (batched GEMM), which produces small floating-point
-    differences (~0.06 per layer) that accumulate across 30 layers (~25 final diff for
-    the 26B model). Both are mathematically correct; the gap is purely numerical.
+    Numerics note: this implementation uses index_add_ accumulation (matching HF eager)
+    to get bit-exact agreement with HF when _experts_implementation='eager'.
+    HF's default grouped_mm uses reshape+sum which has different FP accumulation order
+    in bfloat16, causing ~0.96 cos_sim after 30 layers. With this index_add_ style
+    both models match exactly (max_diff = 0, cos = 1.0).
     """
     def __init__(self, cfg: TextConfig):
         super().__init__()
@@ -436,27 +436,27 @@ class TextExperts(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,          # [T, D]
-        top_k_index: torch.Tensor, # [T, K]
+        x: torch.Tensor,           # [T, D]
+        top_k_index: torch.Tensor,  # [T, K]
         top_k_weights: torch.Tensor, # [T, K]
     ) -> torch.Tensor:
         T, D = x.shape
-        out = torch.zeros_like(x)
+        out = torch.zeros(T, D, dtype=x.dtype, device=x.device)
 
-        # expert_mask[e, k, t] = 1 iff token t's k-th slot chose expert e
+        # [T, K, E] → [E, K, T] so we can iterate over experts (matches HF eager layout)
         expert_mask = F.one_hot(top_k_index, self.num_experts)  # [T, K, E]
         expert_mask = expert_mask.permute(2, 1, 0)              # [E, K, T]
-        active_experts = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=False)
+        active_experts = (expert_mask.sum(dim=(1, 2)) > 0).nonzero(as_tuple=True)[0]
 
-        for idx in active_experts:
-            e = idx[0].item()
-            top_k_pos, token_idx = torch.where(expert_mask[e])  # slots & tokens for expert e
-            h = x[token_idx]                                     # [n, D]
+        for expert_idx in active_experts:
+            e = expert_idx.item()
+            k_slot, tok_idx = torch.where(expert_mask[e])   # [n], [n]
+            h = x[tok_idx]                                   # [n, D]
             gate, up = F.linear(h, self.gate_up_proj[e]).chunk(2, dim=-1)
             h = self.act(gate) * up
-            h = F.linear(h, self.down_proj[e])                   # [n, D]
-            h = h * top_k_weights[token_idx, top_k_pos, None]   # apply routing weights
-            out.index_add_(0, token_idx, h.to(out.dtype))
+            h = F.linear(h, self.down_proj[e])               # [n, D]
+            h = h * top_k_weights[tok_idx, k_slot, None]     # apply routing weights
+            out.index_add_(0, tok_idx, h.to(out.dtype))      # accumulate
 
         return out
 

@@ -44,7 +44,7 @@ from gemma4_simple import (
     apply_rotary_pos_emb, apply_2d_rope,
 )
 
-HF_CKPT = "/home/binxu/.cache/huggingface/hub/gemma-4-E4B-it"
+HF_CKPT = "/n/holylfs06/LABS/kempner_fellow_binxuwang/Users/binxuwang/huggingface/hub/gemma-4-E4B-it"
 DEVICE   = "cpu"        # CPU is fine — small tensors
 DTYPE    = torch.bfloat16
 LAYER    = 0            # test against layer 0
