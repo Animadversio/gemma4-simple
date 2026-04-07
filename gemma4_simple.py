@@ -415,11 +415,10 @@ class TextExperts(nn.Module):
     Sparse MoE expert bank.
     Each expert is a SwiGLU FFN. Only experts that receive at least one token are computed.
 
-    Numerics note: this implementation uses index_add_ accumulation (matching HF eager)
-    to get bit-exact agreement with HF when _experts_implementation='eager'.
-    HF's default grouped_mm uses reshape+sum which has different FP accumulation order
-    in bfloat16, causing ~0.96 cos_sim after 30 layers. With this index_add_ style
-    both models match exactly (max_diff = 0, cos = 1.0).
+    Numerics: this index_add_ loop matches HF's eager experts exactly (max_diff=0, cos=1.0).
+    HF's default _experts_implementation=None also falls back to the same index_add_ loop.
+    Set _experts_implementation='grouped_mm' in the HF config to use batched GEMM instead;
+    that produces small FP accumulation differences (~25 max_diff for the 26B model).
     """
     def __init__(self, cfg: TextConfig):
         super().__init__()
