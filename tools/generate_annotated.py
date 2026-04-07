@@ -2,14 +2,14 @@
 """
 generate_annotated.py
 =====================
-Converts gemma4_simple.py into a labml.ai-style annotated HTML page.
+Converts gemma4_simple_annotated.py into a labml.ai-style annotated HTML page.
 
 Two-column layout:
   left (40%)  — prose / math from docstrings and inline # comments
   right (60%) — syntax-highlighted Python source
 
 Usage:
-    python tools/generate_annotated.py [--src gemma4_simple.py] [--out docs/index.html]
+    python tools/generate_annotated.py [--src gemma4_simple_annotated.py] [--out docs/index.html]
 
 Annotation syntax (inside the Python source file):
   - Module / class / function docstrings   → doc panels
@@ -459,8 +459,8 @@ def render_html(sections: list[Section], title: str = "gemma4_simple.py") -> str
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--src", default="gemma4_simple.py",
-                    help="Source Python file (default: gemma4_simple.py)")
+    ap.add_argument("--src", default="gemma4_simple_annotated.py",
+                    help="Source Python file (default: gemma4_simple_annotated.py)")
     ap.add_argument("--out", default="docs/index.html",
                     help="Output HTML file (default: docs/index.html)")
     ap.add_argument("--title", default="Gemma 4 — Annotated Implementation",
